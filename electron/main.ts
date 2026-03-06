@@ -1,7 +1,9 @@
 import { app, BrowserWindow, Menu } from 'electron';
-import isDev from 'electron-is-dev';
 import path from 'path';
 import fs from 'fs';
+
+// Use Electron's built-in packaged check instead of external dependency.
+const isDev = !app.isPackaged;
 
 // Emergency logging - write immediately on module load
 const emergencyLog = (msg: string) => {
