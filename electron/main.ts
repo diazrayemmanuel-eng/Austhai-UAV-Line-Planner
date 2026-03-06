@@ -67,58 +67,132 @@ const createWindow = () => {
     mainWindow.loadURL('http://localhost:5173');
     mainWindow.webContents.openDevTools();
   } else {
-    // Production: Try multiple path resolution approaches
+    // Production: Try multiple path resolution approaches with extensive diagnostics
     let indexPath: string | null = null;
+    
+    const pathCandidates = [];
     
     // Try 1: Using asarUnpack resources (dist is unpacked to app.asar.unpacked/dist)
     if (process.resourcesPath) {
-      const p1 = path.join(process.resourcesPath, 'app.asar.unpacked', 'dist', 'index.html');
-      if (fs.existsSync(p1)) {
-        indexPath = p1;
-        logMain(`Found dist via asarUnpack: ${p1}`);
+      const unpackedDir = path.join(process.resourcesPath, 'app.asar.unpacked');
+      const distDir = path.join(unpackedDir, 'dist');
+      const p1 = path.join(distDir, 'index.html');
+      pathCandidates.push(p1);
+      logMain(`[Try 1] asarUnpack path: ${p1}`);
+      if (fs.existsSync(unpackedDir)) {
+        logMain(`  ✓ asarUnpack dir exists`);
+        if (fs.existsSync(distDir)) {
+          logMain(`  ✓ dist dir exists`);
+          if (fs.existsSync(p1)) {
+            logMain(`  ✓ index.html found!`);
+            indexPath = p1;
+          }
+        } else {
+          const unpackedContents = fs.readdirSync(unpackedDir).slice(0, 20);
+          logMain(`  ✗ dist not found. asarUnpack contains: ${unpackedContents.join(', ')}`);
+        }
+      } else {
+        logMain(`  ✗ asarUnpack dir does not exist`);
       }
     }
     
-    // Try 2: Direct resources dist folder (for dev/testing)
+    // Try 2: Direct resources dist folder (for alternate packaging)
     if (!indexPath && process.resourcesPath) {
       const p2 = path.join(process.resourcesPath, 'dist', 'index.html');
+      pathCandidates.push(p2);
+      logMain(`[Try 2] Direct resources dist: ${p2}`);
       if (fs.existsSync(p2)) {
+        logMain(`  ✓ Found`);
         indexPath = p2;
-        logMain(`Found dist via process.resourcesPath: ${p2}`);
+      } else {
+        const resourcesContents = fs.readdirSync(process.resourcesPath).slice(0, 10);
+        logMain(`  ✗ Not found. Resources dir contains: ${resourcesContents.join(', ')}`);
       }
     }
     
-    // Try 3: Using app.getAppPath() + relative navigation
+    // Try 3: Using app.getAppPath() + relative navigation through app.asar
     if (!indexPath) {
       const basePath = app.getAppPath();
-      const p3 = path.join(basePath, '..', 'dist', 'index.html');
-      if (fs.existsSync(p3)) {
-        indexPath = p3;
-        logMain(`Found dist via app.getAppPath(): ${p3}`);
+      const asarUnpackedPath = path.join(basePath, 'app.asar.unpacked', 'dist', 'index.html');
+      pathCandidates.push(asarUnpackedPath);
+      logMain(`[Try 3] app.asar.unpacked from getAppPath: ${asarUnpackedPath}`);
+      if (fs.existsSync(asarUnpackedPath)) {
+        logMain(`  ✓ Found`);
+        indexPath = asarUnpackedPath;
+      } else {
+        logMain(`  ✗ Not found`);
       }
     }
     
-    // Try 4: Direct exe path
+    // Try 4: Relative path from asar
     if (!indexPath) {
-      const p4 = path.join(app.getPath('exe'), '..', 'resources', 'dist', 'index.html');
+      const basePath = app.getAppPath();
+      const p4 = path.join(basePath, '..', 'dist', 'index.html');
+      pathCandidates.push(p4);
+      logMain(`[Try 4] Relative from getAppPath: ${p4}`);
       if (fs.existsSync(p4)) {
+        logMain(`  ✓ Found`);
         indexPath = p4;
-        logMain(`Found dist via exe path: ${p4}`);
+      } else {
+        logMain(`  ✗ Not found`);
       }
     }
     
-    logMain(`Production load attempt: indexPath=${indexPath || 'NOT FOUND'}`);
+    // Try 5: Direct exe path
+    if (!indexPath) {
+      const p5 = path.join(app.getPath('exe'), '..', 'resources', 'dist', 'index.html');
+      pathCandidates.push(p5);
+      logMain(`[Try 5] From exe path: ${p5}`);
+      if (fs.existsSync(p5)) {
+        logMain(`  ✓ Found`);
+        indexPath = p5;
+      } else {
+        logMain(`  ✗ Not found`);
+      }
+    }
+    
+    // Try 6: From app directory (common for installed apps)
+    if (!indexPath) {
+      const appDir = path.dirname(app.getPath('exe'));
+      const p6 = path.join(appDir, 'resources', 'app.asar.unpacked', 'dist', 'index.html');
+      pathCandidates.push(p6);
+      logMain(`[Try 6] From app dir: ${p6}`);
+      if (fs.existsSync(p6)) {
+        logMain(`  ✓ Found`);
+        indexPath = p6;
+      } else {
+        logMain(`  ✗ Not found`);
+      }
+    }
+    
+    logMain(`=== Production load attempt: indexPath=${indexPath || 'NOT FOUND'} ===`);
     
     if (indexPath) {
       mainWindow.loadFile(indexPath).catch((err: any) => {
-        logMain(`Failed to loadFile: ${err.message}`);
+        logMain(`✗ Failed to loadFile("${indexPath}"): ${err.message}`);
+        // Log file stats if it exists
+        if (fs.existsSync(indexPath)) {
+          const stats = fs.statSync(indexPath);
+          logMain(`  File exists. Size: ${stats.size} bytes, mtime: ${stats.mtime}`);
+        }
+        logMain(`Falling back to about:blank`);
         mainWindow?.loadURL('about:blank');
       });
     } else {
-      logMain(`ERROR: index.html not found in any location`);
+      logMain(`✗ CRITICAL: index.html not found in ANY location`);
+      logMain(`Tried paths:`);
+      pathCandidates.forEach((p, i) => logMain(`  ${i + 1}. ${p}`));
+      logMain(`=== Directory Diagnostics ===`);
       logMain(`process.resourcesPath: ${process.resourcesPath}`);
       logMain(`app.getAppPath(): ${app.getAppPath()}`);
       logMain(`app.getPath('exe'): ${app.getPath('exe')}`);
+      try {
+        const exeDir = path.dirname(app.getPath('exe'));
+        const exeDirContents = fs.readdirSync(exeDir).slice(0, 15);
+        logMain(`exe dir contents: ${exeDirContents.join(', ')}`);
+      } catch (e) {
+        logMain(`Failed to read exe dir: ${e}`);
+      }
       mainWindow.loadURL('about:blank');
     }
   }
