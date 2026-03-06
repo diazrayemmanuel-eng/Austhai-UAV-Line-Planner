@@ -69,19 +69,12 @@
     "appId": "com.droneline.planner",
     "productName": "Austhai UAV Line Planner",
     "files": [
+      "dist/**/*",
       "dist-electron/**/*",
-      "node_modules/**/*",
       "package.json"
     ],
-    "extraResources": [
-      {
-        "from": "public/icon.ico",
-        "to": "icon.ico"
-      },
-      {
-        "from": "dist",
-        "to": "dist"
-      }
+    "asarUnpack": [
+      "node_modules/better-sqlite3/**/*"
     ],
     "directories": {
       "buildResources": "public",
@@ -89,10 +82,9 @@
     },
     "win": {
       "target": [
-        "nsis",
-        "portable"
+        "nsis"
       ],
-      "icon": "icon.ico",
+      "icon": "public/icon.ico",
       "signAndEditExecutable": false,
       "certificateFile": null,
       "certificatePassword": null
