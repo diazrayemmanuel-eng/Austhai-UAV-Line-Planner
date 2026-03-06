@@ -29,6 +29,9 @@ jobs:
       - name: Build renderer
         run: npm run build:vite
 
+      - name: Verify renderer asset URLs
+        run: npm run verify:dist-paths
+
       - name: Build electron main/preload
         run: npm run build:electron
 

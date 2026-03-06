@@ -1,6 +1,7 @@
 import { app, BrowserWindow, Menu } from 'electron';
 import path from 'path';
 import fs from 'fs';
+import { pathToFileURL } from 'url';
 
 // Use Electron's built-in packaged check instead of external dependency.
 const isDev = !app.isPackaged;
@@ -39,6 +40,29 @@ const logMain = (message: string) => {
   }
 };
 
+const createFileProtocolSafeIndex = (indexPath: string): string => {
+  try {
+    const html = fs.readFileSync(indexPath, 'utf8');
+    const fixed = html
+      .replace(/(src|href)="\/(assets\/[^"]+)"/g, '$1="./$2"')
+      .replace(/(src|href)='\/(assets\/[^']+)'/g, "$1='./$2'")
+      .replace(/(src|href)="\/(manifest\.webmanifest)"/g, '$1="./$2"')
+      .replace(/(src|href)='\/(manifest\.webmanifest)'/g, "$1='./$2'");
+
+    if (fixed === html) {
+      return indexPath;
+    }
+
+    const fallbackPath = path.join(app.getPath('userData'), 'index.file-safe.html');
+    fs.writeFileSync(fallbackPath, fixed, 'utf8');
+    logMain(`Created file-protocol-safe index at: ${fallbackPath}`);
+    return fallbackPath;
+  } catch (e) {
+    logMain(`Failed to create file-protocol-safe index: ${String(e)}`);
+    return indexPath;
+  }
+};
+
 const createWindow = () => {
   logMain('createWindow called');
 
@@ -67,9 +91,6 @@ const createWindow = () => {
     mainWindow.loadURL('http://localhost:5173');
     mainWindow.webContents.openDevTools();
   } else {
-    // Temp: Open devtools in production to debug UI issues
-    mainWindow.webContents.openDevTools();
-    
     // Production: Try multiple path resolution approaches with extensive diagnostics
     let indexPath: string | null = null;
     
@@ -171,8 +192,8 @@ const createWindow = () => {
     logMain(`=== Production load attempt: indexPath=${indexPath || 'NOT FOUND'} ===`);
     
     if (indexPath) {
-      // Convert file path to file:// URL, properly handling Windows paths
-      const fileUrl = `file://${path.resolve(indexPath).replace(/\\/g, '/')}`;
+      const safeIndexPath = createFileProtocolSafeIndex(indexPath);
+      const fileUrl = pathToFileURL(path.resolve(safeIndexPath)).toString();
       logMain(`Loading URL: ${fileUrl}`);
       mainWindow.loadURL(fileUrl).catch((err: any) => {
         logMain(`✗ Failed to loadURL("${fileUrl}"): ${err.message}`);

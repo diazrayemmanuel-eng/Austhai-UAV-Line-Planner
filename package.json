@@ -12,6 +12,7 @@
     "build": "vite build && npm run build:electron && electron-builder",
     "build:vite": "vite build",
     "build:electron": "tsc -p electron/tsconfig.json && node electron/rename-electron-output.cjs",
+    "verify:dist-paths": "node scripts/verify-dist-paths.cjs",
     "preview": "vite preview",
     "clean": "rm -rf dist dist-electron",
     "lint": "tsc --noEmit"
