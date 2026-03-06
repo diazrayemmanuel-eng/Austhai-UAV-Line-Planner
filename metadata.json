@@ -1,0 +1,5 @@
+{
+  "name": "Austhai UAV Line Planner",
+  "description": "Professional drone flight line planning tool. Upload shapefiles, set line spacing, and generate optimized flight paths with tie lines.",
+  "requestFramePermissions": []
+}

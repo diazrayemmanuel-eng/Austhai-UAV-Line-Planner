@@ -1,0 +1,20 @@
+node_modules/
+build/
+dist/
+dist-electron/
+release/
+.env*
+!.env.example
+
+# Local/generated artifacts
+*.log
+git_*_tmp.txt
+portable*.log
+rebuild*.log
+final-build.log
+build-log.txt
+eb-final.log
+
+# Local experiments/output folders
+AusthaiUAV-Portable/
+release-packager/
