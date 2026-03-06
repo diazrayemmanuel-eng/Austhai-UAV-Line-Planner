@@ -171,9 +171,11 @@ const createWindow = () => {
     logMain(`=== Production load attempt: indexPath=${indexPath || 'NOT FOUND'} ===`);
     
     if (indexPath) {
-      mainWindow.loadFile(indexPath).catch((err: any) => {
-        logMain(`✗ Failed to loadFile("${indexPath}"): ${err.message}`);
-        // Log file stats if it exists
+      // Convert file path to file:// URL, properly handling Windows paths
+      const fileUrl = `file://${path.resolve(indexPath).replace(/\\/g, '/')}`;
+      logMain(`Loading URL: ${fileUrl}`);
+      mainWindow.loadURL(fileUrl).catch((err: any) => {
+        logMain(`✗ Failed to loadURL("${fileUrl}"): ${err.message}`);
         if (fs.existsSync(indexPath)) {
           const stats = fs.statSync(indexPath);
           logMain(`  File exists. Size: ${stats.size} bytes, mtime: ${stats.mtime}`);
