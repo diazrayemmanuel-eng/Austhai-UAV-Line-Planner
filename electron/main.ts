@@ -67,6 +67,9 @@ const createWindow = () => {
     mainWindow.loadURL('http://localhost:5173');
     mainWindow.webContents.openDevTools();
   } else {
+    // Temp: Open devtools in production to debug UI issues
+    mainWindow.webContents.openDevTools();
+    
     // Production: Try multiple path resolution approaches with extensive diagnostics
     let indexPath: string | null = null;
     
