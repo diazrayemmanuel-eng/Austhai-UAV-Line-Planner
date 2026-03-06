@@ -70,31 +70,40 @@ const createWindow = () => {
     // Production: Try multiple path resolution approaches
     let indexPath: string | null = null;
     
-    // Try 1: Using process.resourcesPath (when available)
+    // Try 1: Using asarUnpack resources (dist is unpacked to app.asar.unpacked/dist)
     if (process.resourcesPath) {
-      const p1 = path.join(process.resourcesPath, 'dist', 'index.html');
+      const p1 = path.join(process.resourcesPath, 'app.asar.unpacked', 'dist', 'index.html');
       if (fs.existsSync(p1)) {
         indexPath = p1;
-        logMain(`Found dist via process.resourcesPath: ${p1}`);
+        logMain(`Found dist via asarUnpack: ${p1}`);
       }
     }
     
-    // Try 2: Using app.getAppPath() + relative navigation
-    if (!indexPath) {
-      const basePath = app.getAppPath();
-      const p2 = path.join(basePath, '..', 'dist', 'index.html');
+    // Try 2: Direct resources dist folder (for dev/testing)
+    if (!indexPath && process.resourcesPath) {
+      const p2 = path.join(process.resourcesPath, 'dist', 'index.html');
       if (fs.existsSync(p2)) {
         indexPath = p2;
-        logMain(`Found dist via app.getAppPath(): ${p2}`);
+        logMain(`Found dist via process.resourcesPath: ${p2}`);
       }
     }
     
-    // Try 3: Direct resources folder
+    // Try 3: Using app.getAppPath() + relative navigation
     if (!indexPath) {
-      const p3 = path.join(app.getPath('exe'), '..', 'resources', 'dist', 'index.html');
+      const basePath = app.getAppPath();
+      const p3 = path.join(basePath, '..', 'dist', 'index.html');
       if (fs.existsSync(p3)) {
         indexPath = p3;
-        logMain(`Found dist via exe path: ${p3}`);
+        logMain(`Found dist via app.getAppPath(): ${p3}`);
+      }
+    }
+    
+    // Try 4: Direct exe path
+    if (!indexPath) {
+      const p4 = path.join(app.getPath('exe'), '..', 'resources', 'dist', 'index.html');
+      if (fs.existsSync(p4)) {
+        indexPath = p4;
+        logMain(`Found dist via exe path: ${p4}`);
       }
     }
     
