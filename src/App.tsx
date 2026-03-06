@@ -65,6 +65,60 @@ interface PlanningSettings {
   gridOffsetY: number;   // meters
 }
 
+// Drone types
+interface DroneSpec {
+  name: string;
+  maxFlightTime: number; // minutes
+  batteryCapacity: number; // Wh
+  cruiseSpeed: number; // m/s
+  maxAltitude: number; // meters AGL
+  weight: number; // kg
+}
+
+interface FlightMissionSettings {
+  droneModel: 'M350' | 'M400';
+  cruiseSpeed: number; // m/s
+  altitude: number; // meters AGL
+  returnToHomeAltitude: number; // meters
+  batteryUsageBuffer: number; // percentage safety margin
+}
+
+interface MissionPoint {
+  id: string;
+  lat: number;
+  lon: number;
+  altitude: number;
+  speed: number;
+  action?: 'hover' | 'photo' | 'video_start' | 'video_stop';
+  actionParam?: any;
+}
+
+interface CompletedLine {
+  id: string;
+  type: 'flight-line' | 'tie-line';
+  completedAt: number; // timestamp
+}
+
+// Drone specifications
+const DRONE_SPECS: Record<string, DroneSpec> = {
+  'M350': {
+    name: 'DJI Matrice 350 RTK',
+    maxFlightTime: 55, // minutes (no wind, no payload)
+    batteryCapacity: 5590, // Wh
+    cruiseSpeed: 15, // m/s (~54 km/h)
+    maxAltitude: 7000, // meters
+    weight: 9.06 // kg
+  },
+  'M400': {
+    name: 'DJI Matrice 400 RTK',
+    maxFlightTime: 46, // minutes (no wind, no payload)
+    batteryCapacity: 5935, // Wh (dual battery system = 11870 Wh)
+    cruiseSpeed: 15, // m/s (~54 km/h)
+    maxAltitude: 7000, // meters
+    weight: 9.7 // kg
+  }
+};
+
 // --- Helpers ---
 
 /**
@@ -155,6 +209,204 @@ function generateLines(
   }
 
   return turf.featureCollection(lines);
+}
+
+// --- Helper Functions for New Features ---
+
+/**
+ * Calculate flight mission statistics
+ */
+function calculateMissionStats(
+  flightLines: FeatureCollection<LineString> | null,
+  tieLines: FeatureCollection<LineString> | null,
+  settings: FlightMissionSettings
+) {
+  if (!flightLines || !tieLines) return null;
+
+  const drone = DRONE_SPECS[settings.droneModel];
+  const flightDistance = turf.length(flightLines, { units: 'kilometers' });
+  const tieDistance = turf.length(tieLines, { units: 'kilometers' });
+  const totalDistance = flightDistance + tieDistance;
+
+  // Calculate flight time (distance / speed, converted from km to m and m/s)
+  const flightTimeMinutes = (totalDistance * 1000) / (settings.cruiseSpeed * 60);
+  
+  // Add time for altitude changes (assume 2 m/s vertical speed)
+  const altitudeTime = (settings.altitude + settings.returnToHomeAltitude) / (2 * 60);
+  
+  // Add safety buffer
+  const totalFlightTime = (flightTimeMinutes + altitudeTime) * (1 + settings.batteryUsageBuffer / 100);
+  
+  // Calculate number of batteries needed
+  const batteriesNeeded = Math.ceil(totalFlightTime / drone.maxFlightTime);
+  
+  // Calculate power consumption (rough estimate: 70% average power draw)
+  const avgPowerDraw = (drone.batteryCapacity * 0.7) / drone.maxFlightTime; // Wh per minute
+  const totalPowerNeeded = totalFlightTime * avgPowerDraw;
+
+  return {
+    totalDistance: totalDistance.toFixed(2),
+    flightDistance: flightDistance.toFixed(2),
+    tieDistance: tieDistance.toFixed(2),
+    estimatedFlightTime: totalFlightTime.toFixed(1),
+    batteriesNeeded,
+    maxFlightTime: drone.maxFlightTime,
+    powerConsumption: totalPowerNeeded.toFixed(0)
+  };
+}
+
+/**
+ * Generate DJI Pilot Mission File
+ */
+function generateDJIWaypoints(
+  flightLines: FeatureCollection<LineString>,
+  tieLines: FeatureCollection<LineString>,
+  altitude: number
+): string {
+  const waypoints: any[] = [];
+  let wpIndex = 0;
+
+  // Add home point
+  waypoints.push({
+    index: wpIndex++,
+    latitude: 0,
+    longitude: 0,
+    altitude: altitude
+  });
+
+  // Add flight line waypoints
+  flightLines.features.forEach(line => {
+    line.geometry.coordinates.forEach((coord, idx) => {
+      waypoints.push({
+        index: wpIndex++,
+        latitude: coord[1],
+        longitude: coord[0],
+        altitude: altitude,
+        speed: 15,
+        action: idx === line.geometry.coordinates.length - 1 ? 'photo' : 'none'
+      });
+    });
+  });
+
+  // Add tie line waypoints
+  tieLines.features.forEach(line => {
+    line.geometry.coordinates.forEach(coord => {
+      waypoints.push({
+        index: wpIndex++,
+        latitude: coord[1],
+        longitude: coord[0],
+        altitude: altitude
+      });
+    });
+  });
+
+  // Add return to home
+  waypoints.push({
+    index: wpIndex,
+    latitude: waypoints[0].latitude,
+    longitude: waypoints[0].longitude,
+    altitude: altitude,
+    action: 'return_to_home'
+  });
+
+  return JSON.stringify({ waypoints }, null, 2);
+}
+
+/**
+ * Generate Litchi Mission CSV
+ */
+function generateLitchiMission(
+  flightLines: FeatureCollection<LineString>,
+  tieLines: FeatureCollection<LineString>,
+  altitude: number,
+  baseLat: number,
+  baseLon: number
+): string {
+  let csv = 'latitude,longitude,altitude(m),heading(deg),curvesize(m),rotationdir,speed(m/s),poi_latitude,poi_longitude,poi_altitude(m),photo_interval(s),action1,action2,action3\n';
+  
+  // Add flight and tie line waypoints
+  const allLines = [...flightLines.features, ...tieLines.features];
+  allLines.forEach((line, lineIdx) => {
+    line.geometry.coordinates.forEach((coord, idx) => {
+      const speed = lineIdx < flightLines.features.length ? 15 : 10; // Flight lines faster than tie lines
+      csv += `${coord[1]},${coord[0]},${altitude},0,0,0,${speed},0,0,0,${lineIdx % 2 === 0 ? 2 : 0},,\n`;
+    });
+  });
+
+  return csv;
+}
+
+/**
+ * Fetch weather data from Open-Meteo API
+ */
+async function fetchWeatherData(latitude: number, longitude: number) {
+  try {
+    const response = await fetch(
+      `https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}&current=temperature_2m,weather_code,wind_speed_10m,wind_direction_10m&temperature_unit=celsius&wind_speed_unit=kmh`
+    );
+    
+    if (!response.ok) throw new Error('Weather API failed');
+    
+    const data = await response.json();
+    const current = data.current;
+    
+    return {
+      windSpeed: current.wind_speed_10m / 3.6, // Convert km/h to m/s
+      windDirection: current.wind_direction_10m,
+      temperature: current.temperature_2m
+    };
+  } catch (error) {
+    console.error('Weather fetch error:', error);
+    return null;
+  }
+}
+
+/**
+ * Calculate optimal flight direction based on wind
+ */
+function getOptimalFlightDirection(windDirection: number): number {
+  // Fly perpendicular to wind for maximum efficiency
+  return (windDirection + 90) % 360;
+}
+
+/**
+ * Check regulatory compliance
+ */
+function checkRegulatoryCompliance(
+  flightLines: FeatureCollection<LineString> | null,
+  altitude: number,
+  maxAltitude: number,
+  airportLat: number,
+  airportLon: number,
+  airportBuffer: number
+): { compliant: boolean; warnings: string[] } {
+  const warnings: string[] = [];
+
+  // Check altitude
+  if (altitude > maxAltitude) {
+    warnings.push(`Altitude ${altitude}m exceeds drone max ${maxAltitude}m`);
+  }
+
+  // Check airport proximity
+  if (flightLines) {
+    flightLines.features.forEach(line => {
+      line.geometry.coordinates.forEach(coord => {
+        const distance = turf.distance(
+          turf.point([airportLon, airportLat]),
+          turf.point(coord),
+          { units: 'meters' }
+        );
+        if (distance < airportBuffer) {
+          warnings.push(`Flight area ${Math.round(distance)}m from airport (${airportBuffer}m required)`);
+        }
+      });
+    });
+  }
+
+  return {
+    compliant: warnings.length === 0,
+    warnings
+  };
 }
 
 // --- Components ---
@@ -248,6 +500,25 @@ export default function App() {
   const [areaUnit, setAreaUnit] = useState<'m2' | 'km2' | 'hectare'>('km2');
   const [elevationProfile, setElevationProfile] = useState<{distance: number, elevation: number}[] | null>(null);
   const [isFetchingElevation, setIsFetchingElevation] = useState(false);
+
+  // New feature states
+  const [flightMission, setFlightMission] = useState<FlightMissionSettings>({
+    droneModel: 'M350',
+    cruiseSpeed: 15,
+    altitude: 100,
+    returnToHomeAltitude: 50,
+    batteryUsageBuffer: 15
+  });
+  const [weatherData, setWeatherData] = useState<{windSpeed: number, windDirection: number, temperature: number} | null>(null);
+  const [isFetchingWeather, setIsFetchingWeather] = useState(false);
+  const [completedLines, setCompletedLines] = useState<CompletedLine[]>([]);
+  const [regulatorySettings, setRegulatorySettings] = useState({
+    altitudeLimit: 120, // meters AGL
+    nearestAirportLat: 0,
+    nearestAirportLon: 0,
+    airportProximity: 5000, // meters
+    requiresAuthorization: false
+  });
 
   const fetchElevationProfile = async (line: Feature<LineString>) => {
     setIsFetchingElevation(true);
@@ -566,6 +837,60 @@ export default function App() {
     setDeletedLineIds(new Set());
     setModifiedLines({});
     setSelectedLineId(null);
+  };
+
+  const handleFetchWeather = async () => {
+    if (!mainPolygon) return;
+    setIsFetchingWeather(true);
+    try {
+      const center = turf.center(mainPolygon);
+      const weather = await fetchWeatherData(
+        center.geometry.coordinates[1],
+        center.geometry.coordinates[0]
+      );
+      if (weather) {
+        setWeatherData(weather);
+      }
+    } catch (err) {
+      console.error('Weather fetch error:', err);
+    } finally {
+      setIsFetchingWeather(false);
+    }
+  };
+
+  const handleMarkLineComplete = (lineId: string, type: 'flight-line' | 'tie-line') => {
+    setCompletedLines(prev => {
+      const exists = prev.find(l => l.id === lineId);
+      if (exists) {
+        return prev.filter(l => l.id !== lineId);
+      }
+      return [...prev, { id: lineId, type, completedAt: Date.now() }];
+    });
+  };
+
+  const handleExportMission = (format: 'dji' | 'litchi') => {
+    if (!flightLines || !tieLines || !mainPolygon) return;
+    
+    const baseName = fileName ? fileName.split('.')[0] : 'drone-mission';
+    let content: string;
+    let filename: string;
+    let mimeType: string;
+
+    const center = turf.center(mainPolygon);
+    const baseCoords = center.geometry.coordinates;
+
+    if (format === 'dji') {
+      content = generateDJIWaypoints(flightLines, tieLines, flightMission.altitude);
+      filename = `${baseName}-dji.json`;
+      mimeType = 'application/json';
+    } else {
+      content = generateLitchiMission(flightLines, tieLines, flightMission.altitude, baseCoords[1], baseCoords[0]);
+      filename = `${baseName}-litchi.csv`;
+      mimeType = 'text/csv';
+    }
+
+    const blob = new Blob([content], { type: mimeType });
+    downloadBlob(blob, filename);
   };
 
   const latLngToUTM = (lat: number, lng: number) => {
@@ -917,6 +1242,33 @@ export default function App() {
   };
 
   const combinedGeoJSON = useMemo(() => getCombinedGeoJSON(), [flightLines, tieLines, mainPolygon, settings]);
+  
+  const missionStats = useMemo(() => calculateMissionStats(flightLines, tieLines, flightMission), [flightLines, tieLines, flightMission]);
+  
+  const regulatoryCompliance = useMemo(() => {
+    if (!mainPolygon) return null;
+    const drone = DRONE_SPECS[flightMission.droneModel];
+    return checkRegulatoryCompliance(
+      flightLines,
+      flightMission.altitude,
+      drone.maxAltitude,
+      regulatorySettings.nearestAirportLat,
+      regulatorySettings.nearestAirportLon,
+      regulatorySettings.airportProximity
+    );
+  }, [flightLines, flightMission, regulatorySettings, mainPolygon]);
+  
+  const completionStats = useMemo(() => {
+    if (!flightLines && !tieLines) return null;
+    const totalLines = (flightLines?.features.length || 0) + (tieLines?.features.length || 0);
+    const completed = completedLines.length;
+    return {
+      total: totalLines,
+      completed,
+      remaining: totalLines - completed,
+      percentage: totalLines > 0 ? Math.round((completed / totalLines) * 100) : 0
+    };
+  }, [flightLines, tieLines, completedLines]);
 
   return (
     <div className="flex h-screen w-full overflow-hidden bg-white text-slate-900">
@@ -1462,6 +1814,187 @@ export default function App() {
                   <p className="text-[10px] text-blue-600/60 uppercase mb-1">Total Path Length</p>
                   <p className="text-lg font-mono text-blue-600">{stats.totalLength} <span className="text-xs opacity-50">km</span></p>
                 </div>
+              </div>
+            </section>
+          )}
+
+          {/* Flight Mission Settings */}
+          {geoJson && (
+            <section className="pt-4 border-t border-slate-100 space-y-4">
+              <label className="block text-[10px] uppercase tracking-widest text-slate-400 mb-4 font-mono">7. Flight Mission Setup</label>
+              
+              <div>
+                <label className="text-xs text-slate-600 mb-2 block">Drone Model</label>
+                <select 
+                  value={flightMission.droneModel}
+                  onChange={(e) => setFlightMission(m => ({ ...m, droneModel: e.target.value as 'M350' | 'M400' }))}
+                  className="w-full bg-slate-50 border border-slate-200 rounded px-2 py-1.5 text-xs font-mono text-slate-900 focus:border-blue-500/50 outline-none"
+                >
+                  <option value="M350">DJI Matrice 350 RTK</option>
+                  <option value="M400">DJI Matrice 400 RTK</option>
+                </select>
+              </div>
+
+              <div>
+                <div className="flex justify-between mb-2">
+                  <label className="text-xs text-slate-600">Flight Altitude (m AGL)</label>
+                  <input 
+                    type="number"
+                    value={flightMission.altitude}
+                    onChange={(e) => setFlightMission(m => ({ ...m, altitude: Number(e.target.value) }))}
+                    className="w-16 bg-slate-50 border border-slate-200 rounded px-1.5 py-0.5 text-xs font-mono text-blue-600 text-right focus:border-blue-500/50 outline-none"
+                  />
+                </div>
+                <input 
+                  type="range" min="10" max="500" step="5"
+                  value={flightMission.altitude}
+                  onChange={(e) => setFlightMission(m => ({ ...m, altitude: Number(e.target.value) }))}
+                  className="w-full h-1.5 bg-slate-100 rounded-lg appearance-none cursor-pointer accent-blue-600"
+                />
+              </div>
+
+              <div>
+                <div className="flex justify-between mb-2">
+                  <label className="text-xs text-slate-600">Cruise Speed (m/s)</label>
+                  <input 
+                    type="number"
+                    value={flightMission.cruiseSpeed}
+                    onChange={(e) => setFlightMission(m => ({ ...m, cruiseSpeed: Number(e.target.value) }))}
+                    className="w-12 bg-slate-50 border border-slate-200 rounded px-1.5 py-0.5 text-xs font-mono text-blue-600 text-right focus:border-blue-500/50 outline-none"
+                  />
+                </div>
+                <input 
+                  type="range" min="5" max="25" step="0.5"
+                  value={flightMission.cruiseSpeed}
+                  onChange={(e) => setFlightMission(m => ({ ...m, cruiseSpeed: Number(e.target.value) }))}
+                  className="w-full h-1.5 bg-slate-100 rounded-lg appearance-none cursor-pointer accent-blue-600"
+                />
+              </div>
+
+              {missionStats && (
+                <div className="bg-gradient-to-br from-green-50 to-emerald-50 rounded-xl p-4 border border-green-100 space-y-3">
+                  <div className="flex justify-between text-xs">
+                    <span className="text-slate-600">Est. Flight Time</span>
+                    <span className="font-mono font-bold text-green-700">{missionStats.estimatedFlightTime} min</span>
+                  </div>
+                  <div className="flex justify-between text-xs">
+                    <span className="text-slate-600">Batteries Needed</span>
+                    <span className="font-mono font-bold text-green-700">{missionStats.batteriesNeeded}</span>
+                  </div>
+                  <div className="flex justify-between text-xs">
+                    <span className="text-slate-600">Total Distance</span>
+                    <span className="font-mono font-bold text-green-700">{missionStats.totalDistance} km</span>
+                  </div>
+                </div>
+              )}
+            </section>
+          )}
+
+          {/* Mission Export Section */}
+          {geoJson && missionStats && (
+            <section className="pt-4 border-t border-slate-100 space-y-3">
+              <label className="block text-[10px] uppercase tracking-widest text-slate-400 mb-3 font-mono">8. Export Mission</label>
+              <button 
+                onClick={() => handleExportMission('dji')}
+                className="w-full bg-purple-50 hover:bg-purple-100 text-purple-700 font-bold py-2 text-xs rounded-lg border border-purple-200 transition-all"
+              >
+                DJI Pilot (.json)
+              </button>
+              <button 
+                onClick={() => handleExportMission('litchi')}
+                className="w-full bg-amber-50 hover:bg-amber-100 text-amber-700 font-bold py-2 text-xs rounded-lg border border-amber-200 transition-all"
+              >
+                Litchi Mission (.csv)
+              </button>
+            </section>
+          )}
+
+          {/* Progress Tracking Section */}
+          {geoJson && completionStats && (
+            <section className="pt-4 border-t border-slate-100 space-y-3">
+              <label className="block text-[10px] uppercase tracking-widest text-slate-400 mb-3 font-mono">9. Progress Tracking</label>
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs text-slate-600">Completion</span>
+                  <span className="text-xs font-bold text-slate-900">{completionStats.completed}/{completionStats.total}</span>
+                </div>
+                <div className="w-full bg-slate-100 rounded-full h-2 overflow-hidden">
+                  <div 
+                    className="bg-blue-600 h-full transition-all duration-300"
+                    style={{ width: `${completionStats.percentage}%` }}
+                  />
+                </div>
+                <p className="text-[10px] text-slate-400 text-center">{completionStats.percentage}% Complete • {completionStats.remaining} Remaining</p>
+              </div>
+            </section>
+          )}
+
+          {/* Weather Section */}
+          {geoJson && (
+            <section className="pt-4 border-t border-slate-100 space-y-3">
+              <div className="flex items-center justify-between">
+                <label className="text-[10px] uppercase tracking-widest text-slate-400 font-mono">10. Weather  Data</label>
+                <button 
+                  onClick={handleFetchWeather}
+                  disabled={isFetchingWeather}
+                  className="px-2 py-1 bg-cyan-50 hover:bg-cyan-100 disabled:opacity-50 text-cyan-700 text-[10px] font-bold rounded border border-cyan-200 transition-all"
+                >
+                  {isFetchingWeather ? 'Loading...' : 'Fetch'}
+                </button>
+              </div>
+              {weatherData && (
+                <div className="bg-cyan-50 rounded-xl p-3 border border-cyan-100 space-y-2">
+                  <div className="flex justify-between text-xs">
+                    <span className="text-slate-600">Wind Speed</span>
+                    <span className="font-mono font-bold">{weatherData.windSpeed.toFixed(1)} m/s</span>
+                  </div>
+                  <div className="flex justify-between text-xs">
+                    <span className="text-slate-600">Wind Direction</span>
+                    <span className="font-mono font-bold">{weatherData.windDirection}°</span>
+                  </div>
+                  <div className="flex justify-between text-xs">
+                    <span className="text-slate-600">Temperature</span>
+                    <span className="font-mono font-bold">{weatherData.temperature}°C</span>
+                  </div>
+                  <div className="pt-2 border-t border-cyan-200 text-[10px] text-cyan-700 font-medium">
+                    💡 Optimal flight direction: {getOptimalFlightDirection(weatherData.windDirection)}°
+                  </div>
+                </div>
+              )}
+            </section>
+          )}
+
+          {/* Regulatory Compliance Section */}
+          {geoJson && regulatoryCompliance && (
+            <section className="pt-4 border-t border-slate-100 space-y-3">
+              <label className="block text-[10px] uppercase tracking-widest text-slate-400 mb-3 font-mono">11. Regulatory Compliance</label>
+              
+              <div>
+                <label className="text-xs text-slate-600 mb-2 block">Max Altitude Limit (m)</label>
+                <input 
+                  type="number"
+                  value={regulatorySettings.altitudeLimit}
+                  onChange={(e) => setRegulatorySettings(r => ({ ...r, altitudeLimit: Number(e.target.value) }))}
+                  className="w-full bg-slate-50 border border-slate-200 rounded px-2 py-1 text-xs font-mono text-slate-900 focus:border-blue-500/50 outline-none"
+                />
+              </div>
+
+              <div className={cn(
+                "rounded-xl p-3 border",
+                regulatoryCompliance.compliant
+                  ? "bg-green-50 border-green-200"
+                  : "bg-red-50 border-red-200"
+              )}>
+                <p className={cn("text-xs font-bold mb-2", regulatoryCompliance.compliant ? "text-green-700" : "text-red-700")}>
+                  {regulatoryCompliance.compliant ? "✓ Compliant" : "⚠ Compliance Issues"}
+                </p>
+                {regulatoryCompliance.warnings.length > 0 && (
+                  <div className="space-y-1">
+                    {regulatoryCompliance.warnings.map((warning, idx) => (
+                      <p key={idx} className="text-[10px] text-slate-600">{warning}</p>
+                    ))}
+                  </div>
+                )}
               </div>
             </section>
           )}
