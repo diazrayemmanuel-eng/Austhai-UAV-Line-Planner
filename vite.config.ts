@@ -7,6 +7,8 @@ import { VitePWA } from 'vite-plugin-pwa';
 export default defineConfig(({mode}) => {
   const env = loadEnv(mode, '.', '');
   return {
+    // Required for Electron file:// loading so built assets use relative paths.
+    base: './',
     plugins: [
       react(), 
       tailwindcss(),
@@ -47,8 +49,10 @@ export default defineConfig(({mode}) => {
     },
     server: {
       // HMR is disabled in AI Studio via DISABLE_HMR env var.
-      // Do not modifyâfile watching is disabled to prevent flickering during agent edits.
-      hmr: process.env.DISABLE_HMR !== 'true',      port: 5173,
-      strictPort: false,    },
+      // Do not modify; file watching is disabled to prevent flickering during agent edits.
+      hmr: process.env.DISABLE_HMR !== 'true',
+      port: 5173,
+      strictPort: false,
+    },
   };
 });
