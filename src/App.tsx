@@ -159,15 +159,23 @@ function generateLines(
 
 // --- Components ---
 
-const Logo = ({ className = "", grayscale = false, light = false }: { className?: string, grayscale?: boolean, light?: boolean }) => (
-  <div className={cn("flex items-center gap-3", className, grayscale && "grayscale opacity-50")}>
-    <img 
-      src={austaThaiLogo} 
-      alt="Austhai Logo" 
-      className="w-10 h-10 object-contain rounded-xl shadow-lg shadow-blue-600/10 shrink-0 border border-slate-100 p-1 bg-white" 
-    />
-  </div>
-);
+const Logo = ({ className = "", grayscale = false, light = false, size = "large" }: { className?: string, grayscale?: boolean, light?: boolean, size?: "small" | "medium" | "large" }) => {
+  const sizeClasses = {
+    small: "w-10 h-10 p-1",
+    medium: "w-16 h-16 p-1.5",
+    large: "w-24 h-24 p-2"
+  };
+  
+  return (
+    <div className={cn("flex items-center justify-center gap-3", className, grayscale && "grayscale opacity-50")}>
+      <img 
+        src={austaThaiLogo} 
+        alt="Austhai Logo" 
+        className={cn("object-contain rounded-xl shadow-lg shadow-blue-600/10 shrink-0 border border-slate-100 bg-white", sizeClasses[size])}
+      />
+    </div>
+  );
+};
 
 function MapController({ bounds, onMapClick, setMapInstance }: { bounds: BBox | null, onMapClick?: (e: any) => void, setMapInstance?: (map: L.Map) => void }) {
   const map = useMap();
@@ -195,7 +203,15 @@ function MapController({ bounds, onMapClick, setMapInstance }: { bounds: BBox | 
   return null;
 }
 
+// --- Uploaded File Type ---
+interface UploadedFile {
+  id: string;
+  name: string;
+  geoJson: FeatureCollection;
+}
+
 export default function App() {
+  const [uploadedFiles, setUploadedFiles] = useState<UploadedFile[]>([]);
   const [geoJson, setGeoJson] = useState<FeatureCollection | null>(null);
   const [settings, setSettings] = useState<PlanningSettings>({
     flightLineSpacing: 25,
@@ -308,6 +324,61 @@ export default function App() {
     }
   };
 
+  // Merge uploaded files into single GeoJSON
+  useEffect(() => {
+    if (uploadedFiles.length === 0) {
+      setGeoJson(null);
+      setFileName('');
+      return;
+    }
+
+    try {
+      // Collect all polygon features from all uploaded files
+      const allPolygons: Feature<Polygon | MultiPolygon>[] = [];
+      
+      uploadedFiles.forEach(file => {
+        const polys = file.geoJson.features.filter(
+          f => f.geometry.type === 'Polygon' || f.geometry.type === 'MultiPolygon'
+        ) as Feature<Polygon | MultiPolygon>[];
+        allPolygons.push(...polys);
+      });
+
+      if (allPolygons.length === 0) {
+        setGeoJson(null);
+        return;
+      }
+
+      // Merge all polygons into a single unified polygon using union
+      let mergedPolygon: Feature<Polygon | MultiPolygon> = allPolygons[0];
+      
+      for (let i = 1; i < allPolygons.length; i++) {
+        try {
+          const unionResult = turf.union(turf.featureCollection([mergedPolygon, allPolygons[i]]));
+          if (unionResult) {
+            mergedPolygon = unionResult as Feature<Polygon | MultiPolygon>;
+          }
+        } catch (err) {
+          console.warn(`Failed to merge polygon ${i}, including separately`, err);
+          // If union fails, just keep both polygons separate
+        }
+      }
+
+      // Create the merged FeatureCollection
+      const mergedGeoJson = turf.featureCollection([mergedPolygon]);
+      setGeoJson(mergedGeoJson as any);
+      
+      // Update filename to reflect multiple files
+      if (uploadedFiles.length === 1) {
+        setFileName(uploadedFiles[0].name);
+      } else {
+        setFileName(`${uploadedFiles.length} files merged`);
+      }
+    } catch (err) {
+      console.error("Error merging files:", err);
+      alert("Error merging uploaded files. Please ensure all files contain valid polygon data.");
+    }
+  }, [uploadedFiles]);
+
   // Reset manual edits when settings change
   useEffect(() => {
     setDeletedLineIds(new Set());
@@ -392,79 +463,109 @@ export default function App() {
 
   // Handlers
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
+    const files = e.target.files;
+    if (!files || files.length === 0) return;
 
     setIsProcessing(true);
-    setFileName(file.name);
-    const extension = file.name.split('.').pop()?.toLowerCase();
 
     try {
-      const buffer = await file.arrayBuffer();
-      let data: any = null;
+      const newFiles: UploadedFile[] = [];
 
-      console.log(`Processing file: ${file.name} (${buffer.byteLength} bytes) extension: ${extension}`);
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        const extension = file.name.split('.').pop()?.toLowerCase();
 
-      if (extension === 'kml') {
-        const text = new TextDecoder().decode(buffer);
-        const dom = new DOMParser().parseFromString(text, 'text/xml');
-        data = kml(dom);
-      } else if (extension === 'kmz') {
-        const zip = await JSZip.loadAsync(buffer);
-        const kmlFile = Object.keys(zip.files).find(name => name.endsWith('.kml'));
-        if (!kmlFile) throw new Error("No KML file found inside KMZ");
-        const kmlText = await zip.files[kmlFile].async('string');
-        const dom = new DOMParser().parseFromString(kmlText, 'text/xml');
-        data = kml(dom);
-      } else if (extension === 'json' || extension === 'geojson') {
-        const text = new TextDecoder().decode(buffer);
-        data = JSON.parse(text);
-      } else {
-        // Assume shapefile zip for other extensions or .zip
         try {
-          data = await shp(buffer);
-        } catch (err: any) {
-          if (extension !== 'zip') {
-            throw new Error(`Unsupported file format: .${extension}. Please use .zip (Shapefile), .kml, .kmz, or .geojson`);
+          const buffer = await file.arrayBuffer();
+          let data: any = null;
+
+          console.log(`Processing file: ${file.name} (${buffer.byteLength} bytes) extension: ${extension}`);
+
+          if (extension === 'kml') {
+            const text = new TextDecoder().decode(buffer);
+            const dom = new DOMParser().parseFromString(text, 'text/xml');
+            data = kml(dom);
+          } else if (extension === 'kmz') {
+            const zip = await JSZip.loadAsync(buffer);
+            const kmlFile = Object.keys(zip.files).find(name => name.endsWith('.kml'));
+            if (!kmlFile) throw new Error("No KML file found inside KMZ");
+            const kmlText = await zip.files[kmlFile].async('string');
+            const dom = new DOMParser().parseFromString(kmlText, 'text/xml');
+            data = kml(dom);
+          } else if (extension === 'json' || extension === 'geojson') {
+            const text = new TextDecoder().decode(buffer);
+            data = JSON.parse(text);
+          } else {
+            // Assume shapefile zip for other extensions or .zip
+            try {
+              data = await shp(buffer);
+            } catch (err: any) {
+              if (extension !== 'zip') {
+                throw new Error(`Unsupported file format: .${extension}. Please use .zip (Shapefile), .kml, .kmz, or .geojson`);
+              }
+              throw err;
+            }
           }
-          throw err;
+
+          if (!data) {
+            throw new Error("No data returned from file parser.");
+          }
+
+          // Standardize the output to a FeatureCollection
+          let fileGeoJson: FeatureCollection;
+          
+          if (Array.isArray(data)) {
+            // Find the first feature collection with polygons
+            const collectionWithPolygons = data.find(item => 
+              item.type === 'FeatureCollection' && 
+              item.features.some((f: any) => f.geometry.type === 'Polygon' || f.geometry.type === 'MultiPolygon')
+            );
+            fileGeoJson = (collectionWithPolygons || data[0]) as FeatureCollection;
+          } else if (data.type === 'FeatureCollection') {
+            fileGeoJson = data as FeatureCollection;
+          } else if (data.type === 'Feature') {
+            fileGeoJson = turf.featureCollection([data]) as FeatureCollection;
+          } else {
+            fileGeoJson = data as FeatureCollection;
+          }
+
+          // Add to the list of uploaded files
+          newFiles.push({
+            id: `${Date.now()}-${i}`,
+            name: file.name,
+            geoJson: fileGeoJson
+          });
+
+        } catch (err: any) {
+          console.error(`Error processing ${file.name}:`, err);
+          alert(`Error processing ${file.name}: ${err.message || String(err)}`);
         }
       }
 
-      if (!data) {
-        throw new Error("No data returned from file parser.");
+      // Add all successfully processed files to state
+      if (newFiles.length > 0) {
+        setUploadedFiles(prev => [...prev, ...newFiles]);
       }
 
-      // Standardize the output to a FeatureCollection
-      if (Array.isArray(data)) {
-        // Find the first feature collection with polygons
-        const collectionWithPolygons = data.find(item => 
-          item.type === 'FeatureCollection' && 
-          item.features.some((f: any) => f.geometry.type === 'Polygon' || f.geometry.type === 'MultiPolygon')
-        );
-        setGeoJson((collectionWithPolygons || data[0]) as any);
-      } else if (data.type === 'FeatureCollection') {
-        setGeoJson(data as any);
-      } else if (data.type === 'Feature') {
-        setGeoJson(turf.featureCollection([data]) as any);
-      } else {
-        // Handle cases where shpjs or togeojson might return something else
-        setGeoJson(data as any);
-      }
     } catch (err: any) {
-      console.error("File processing error:", err);
-      const errorMessage = err?.message || String(err);
-      const isZipError = errorMessage.toLowerCase().includes('unzip') || errorMessage.toLowerCase().includes('zip');
-      
-      alert(
-        `File processing error: ${errorMessage}\n\n` +
-        (isZipError 
-          ? "Tip: This usually means the .zip or .kmz file is invalid or corrupted."
-          : "Tip: Ensure you are uploading a valid .kml, .kmz, .geojson, or shapefile .zip archive.")
-      );
+      console.error("File upload error:", err);
+      alert(`File upload error: ${err.message || String(err)}`);
     } finally {
       setIsProcessing(false);
+      // Reset the input so same files can be uploaded again if removed
+      e.target.value = '';
     }
+  };
+
+  const handleRemoveFile = (fileId: string) => {
+    setUploadedFiles(prev => prev.filter(f => f.id !== fileId));
+  };
+
+  const handleClearAll = () => {
+    setUploadedFiles([]);
+    setDeletedLineIds(new Set());
+    setModifiedLines({});
+    setSelectedLineId(null);
   };
 
   const latLngToUTM = (lat: number, lng: number) => {
@@ -589,11 +690,11 @@ export default function App() {
         const blob = new Blob([JSON.stringify(combined)], { type: 'application/json' });
         downloadBlob(blob, `${baseName}-plan.geojson`);
       } else if (exportFormat === 'kml') {
-        const kmlContent = tokml(combined);
+        const kmlContent = generateKMLWithStyles(combined);
         const blob = new Blob([kmlContent], { type: 'application/vnd.google-earth.kml+xml' });
         downloadBlob(blob, `${baseName}-plan.kml`);
       } else if (exportFormat === 'kmz') {
-        const kmlContent = tokml(combined);
+        const kmlContent = generateKMLWithStyles(combined);
         const zip = new JSZip();
         zip.file("doc.kml", kmlContent);
         const content = await zip.generateAsync({ type: "blob" });
@@ -614,21 +715,25 @@ export default function App() {
   const getCombinedGeoJSON = () => {
     if (!flightLines || !tieLines) return turf.featureCollection([]);
     const features = [
-      ...flightLines.features.map((f) => ({ 
+      ...flightLines.features.map((f, idx) => ({ 
         ...f, 
         properties: { 
-          type: 'flight-line',
-          name: 'Flight Line',
+          type: 'Flight Line',
+          category: 'flight-line',
+          lineNumber: idx + 1,
+          name: `Flight Line ${idx + 1}`,
           stroke: settings.flightLineColor,
           'stroke-width': 3,
           'stroke-opacity': 1
         } 
       })),
-      ...tieLines.features.map((f) => ({ 
+      ...tieLines.features.map((f, idx) => ({ 
         ...f, 
         properties: { 
-          type: 'tie-line',
-          name: 'Tie Line',
+          type: 'Tie Line',
+          category: 'tie-line',
+          lineNumber: idx + 1,
+          name: `Tie Line ${idx + 1}`,
           stroke: settings.tieLineColor,
           'stroke-width': 1.5,
           'stroke-opacity': 0.8,
@@ -636,11 +741,179 @@ export default function App() {
         } 
       }))
     ];
-    // Add boundary if available (with no fill or stroke so it's transparent)
+    // Add boundary with proper styling
     if (mainPolygon) {
-      features.push({ ...mainPolygon, properties: { type: 'boundary', 'fill-opacity': 0, 'stroke-opacity': 0 } });
+      features.push({ 
+        ...mainPolygon, 
+        properties: { 
+          type: 'Boundary',
+          category: 'boundary',
+          name: 'Survey Boundary',
+          stroke: settings.boundaryColor,
+          'stroke-width': 2,
+          'stroke-opacity': 1,
+          fill: settings.boundaryColor,
+          'fill-opacity': 0.1
+        } 
+      });
     }
     return turf.featureCollection(features);
+  };
+
+  const generateKMLWithStyles = (geoJsonData: FeatureCollection) => {
+    // Helper to convert hex color to KML color (aabbggrr format)
+    const hexToKmlColor = (hex: string, opacity: number = 1) => {
+      const alpha = Math.floor(opacity * 255).toString(16).padStart(2, '0');
+      const rgb = hex.replace('#', '');
+      const r = rgb.substring(0, 2);
+      const g = rgb.substring(2, 4);
+      const b = rgb.substring(4, 6);
+      return `${alpha}${b}${g}${r}`;
+    };
+
+    // Fixed colors for KML export (Google Earth display)
+    const flightLineColor = '#90EE90'; // Light green
+    const tieLineColor = '#FFFF00';    // Yellow
+    const boundaryColor = '#FF0000';   // Red
+
+    // KML header with styles
+    let kml = '<?xml version="1.0" encoding="UTF-8"?>\n';
+    kml += '<kml xmlns="http://www.opengis.net/kml/2.2">\n';
+    kml += '<Document>\n';
+    kml += '  <name>Drone Line Plan</name>\n';
+    kml += '  <description>Generated by Austhai UAV Line Planner</description>\n\n';
+
+    // Define styles for each line type with fixed colors
+    kml += '  <Style id="flightLineStyle">\n';
+    kml += '    <LineStyle>\n';
+    kml += `      <color>${hexToKmlColor(flightLineColor, 1)}</color>\n`;
+    kml += '      <width>1.5</width>\n';
+    kml += '    </LineStyle>\n';
+    kml += '  </Style>\n\n';
+
+    kml += '  <Style id="tieLineStyle">\n';
+    kml += '    <LineStyle>\n';
+    kml += `      <color>${hexToKmlColor(tieLineColor, 1)}</color>\n`;
+    kml += '      <width>2.5</width>\n';
+    kml += '    </LineStyle>\n';
+    kml += '  </Style>\n\n';
+
+    kml += '  <Style id="boundaryStyle">\n';
+    kml += '    <LineStyle>\n';
+    kml += `      <color>${hexToKmlColor(boundaryColor, 1)}</color>\n`;
+    kml += '      <width>3</width>\n';
+    kml += '    </LineStyle>\n';
+    kml += '    <PolyStyle>\n';
+    kml += `      <color>${hexToKmlColor(boundaryColor, 0.15)}</color>\n`;
+    kml += '      <fill>1</fill>\n';
+    kml += '      <outline>1</outline>\n';
+    kml += '    </PolyStyle>\n';
+    kml += '  </Style>\n\n';
+
+    // Create folders for organization
+    const flightLineFeatures = geoJsonData.features.filter(f => f.properties?.category === 'flight-line');
+    const tieLineFeatures = geoJsonData.features.filter(f => f.properties?.category === 'tie-line');
+    const boundaryFeatures = geoJsonData.features.filter(f => f.properties?.category === 'boundary');
+
+    // Flight Lines Folder
+    if (flightLineFeatures.length > 0) {
+      kml += '  <Folder>\n';
+      kml += '    <name>Flight Lines</name>\n';
+      flightLineFeatures.forEach(feature => {
+        kml += '    <Placemark>\n';
+        kml += `      <name>${feature.properties?.name || 'Flight Line'}</name>\n`;
+        kml += '      <styleUrl>#flightLineStyle</styleUrl>\n';
+        kml += '      <ExtendedData>\n';
+        kml += `        <Data name="Type"><value>${feature.properties?.type || ''}</value></Data>\n`;
+        kml += `        <Data name="Line Number"><value>${feature.properties?.lineNumber || ''}</value></Data>\n`;
+        kml += '      </ExtendedData>\n';
+        if (feature.geometry.type === 'LineString') {
+          kml += '      <LineString>\n';
+          kml += '        <coordinates>\n';
+          feature.geometry.coordinates.forEach((coord: number[]) => {
+            kml += `          ${coord[0]},${coord[1]},0\n`;
+          });
+          kml += '        </coordinates>\n';
+          kml += '      </LineString>\n';
+        }
+        kml += '    </Placemark>\n';
+      });
+      kml += '  </Folder>\n\n';
+    }
+
+    // Tie Lines Folder
+    if (tieLineFeatures.length > 0) {
+      kml += '  <Folder>\n';
+      kml += '    <name>Tie Lines</name>\n';
+      tieLineFeatures.forEach(feature => {
+        kml += '    <Placemark>\n';
+        kml += `      <name>${feature.properties?.name || 'Tie Line'}</name>\n`;
+        kml += '      <styleUrl>#tieLineStyle</styleUrl>\n';
+        kml += '      <ExtendedData>\n';
+        kml += `        <Data name="Type"><value>${feature.properties?.type || ''}</value></Data>\n`;
+        kml += `        <Data name="Line Number"><value>${feature.properties?.lineNumber || ''}</value></Data>\n`;
+        kml += '      </ExtendedData>\n';
+        if (feature.geometry.type === 'LineString') {
+          kml += '      <LineString>\n';
+          kml += '        <coordinates>\n';
+          feature.geometry.coordinates.forEach((coord: number[]) => {
+            kml += `          ${coord[0]},${coord[1]},0\n`;
+          });
+          kml += '        </coordinates>\n';
+          kml += '      </LineString>\n';
+        }
+        kml += '    </Placemark>\n';
+      });
+      kml += '  </Folder>\n\n';
+    }
+
+    // Boundary Folder
+    if (boundaryFeatures.length > 0) {
+      kml += '  <Folder>\n';
+      kml += '    <name>Survey Boundary</name>\n';
+      boundaryFeatures.forEach(feature => {
+        kml += '    <Placemark>\n';
+        kml += `      <name>${feature.properties?.name || 'Boundary'}</name>\n`;
+        kml += '      <styleUrl>#boundaryStyle</styleUrl>\n';
+        kml += '      <ExtendedData>\n';
+        kml += `        <Data name="Type"><value>${feature.properties?.type || ''}</value></Data>\n`;
+        kml += '      </ExtendedData>\n';
+        if (feature.geometry.type === 'Polygon') {
+          kml += '      <Polygon>\n';
+          kml += '        <outerBoundaryIs>\n';
+          kml += '          <LinearRing>\n';
+          kml += '            <coordinates>\n';
+          feature.geometry.coordinates[0].forEach((coord: number[]) => {
+            kml += `              ${coord[0]},${coord[1]},0\n`;
+          });
+          kml += '            </coordinates>\n';
+          kml += '          </LinearRing>\n';
+          kml += '        </outerBoundaryIs>\n';
+          kml += '      </Polygon>\n';
+        } else if (feature.geometry.type === 'MultiPolygon') {
+          feature.geometry.coordinates.forEach((polygon: number[][][]) => {
+            kml += '      <Polygon>\n';
+            kml += '        <outerBoundaryIs>\n';
+            kml += '          <LinearRing>\n';
+            kml += '            <coordinates>\n';
+            polygon[0].forEach((coord: number[]) => {
+              kml += `              ${coord[0]},${coord[1]},0\n`;
+            });
+            kml += '            </coordinates>\n';
+            kml += '          </LinearRing>\n';
+            kml += '        </outerBoundaryIs>\n';
+            kml += '      </Polygon>\n';
+          });
+        }
+        kml += '    </Placemark>\n';
+      });
+      kml += '  </Folder>\n\n';
+    }
+
+    kml += '</Document>\n';
+    kml += '</kml>';
+    
+    return kml;
   };
 
   const combinedGeoJSON = useMemo(() => getCombinedGeoJSON(), [flightLines, tieLines, mainPolygon, settings]);
@@ -666,7 +939,7 @@ export default function App() {
             >
               <div className="p-6 border-b border-slate-100 flex items-center justify-between">
                 <div className="flex items-center gap-4">
-                  <Logo />
+                  <Logo size="small" />
                   <div>
                     <h2 className="text-lg font-bold text-slate-900 tracking-tight">Mission Preview</h2>
                     <p className="text-xs text-slate-400 font-mono uppercase tracking-widest">{fileName || 'Untitled Mission'}</p>
@@ -747,13 +1020,13 @@ export default function App() {
       {/* Sidebar */}
       <aside className="w-80 bg-white text-slate-900 flex flex-col border-r border-slate-200 z-20">
         <div className="p-6 border-b border-slate-100 flex flex-col gap-4">
-          <Logo className="mb-2" />
-          <div>
-            <div className="flex items-center gap-2 mb-1">
+          <Logo className="mb-4" />
+          <div className="text-center">
+            <div className="flex items-center justify-center gap-2 mb-1">
               <h1 className="text-lg font-semibold tracking-tight text-slate-900">Austhai UAV <span className="italic font-serif opacity-50 text-sm">Line planner</span></h1>
             </div>
             <p className="text-[9px] text-slate-400 font-medium -mt-1 mb-2">created by Ray Emmanuel B. Diaz</p>
-            <p className="text-[10px] text-slate-400 uppercase tracking-widest font-mono">Mission Control v1.0</p>
+            <p className="text-[10px] text-slate-400 uppercase tracking-widest font-mono">Mission Control v1.0.0</p>
           </div>
           {installPrompt ? (
             <button 
@@ -771,38 +1044,89 @@ export default function App() {
           <section className="bg-blue-50 border border-blue-100 rounded-xl p-4">
             <div className="flex gap-3">
               <Info className="w-4 h-4 text-blue-600 shrink-0 mt-0.5" />
-              <p className="text-[11px] text-blue-600/80 leading-relaxed">
-                Supports <span className="font-bold text-blue-600">KML, KMZ, GeoJSON</span> and <span className="font-bold text-blue-600">Zipped Shapefiles</span> (.shp, .shx, .dbf).
-              </p>
+              <div className="space-y-1">
+                <p className="text-[11px] text-blue-600/80 leading-relaxed">
+                  Supports <span className="font-bold text-blue-600">KML, KMZ, GeoJSON</span> and <span className="font-bold text-blue-600">Zipped Shapefiles</span> (.shp, .shx, .dbf).
+                </p>
+                <p className="text-[10px] text-blue-600/60 leading-relaxed">
+                  Upload multiple files to automatically merge areas for unified line planning.
+                </p>
+              </div>
             </div>
           </section>
 
           {/* Upload Section */}
           <section>
             <label className="block text-[10px] uppercase tracking-widest text-slate-400 mb-3 font-mono">1. Area of Interest</label>
-            {!geoJson ? (
-              <label className="flex flex-col items-center justify-center w-full h-32 border-2 border-dashed border-slate-200 rounded-xl cursor-pointer hover:border-blue-400/50 hover:bg-slate-50 transition-all group">
-                <Upload className="w-8 h-8 text-slate-300 group-hover:text-blue-600 transition-colors mb-2" />
-                <span className="text-xs text-slate-400 group-hover:text-slate-600 text-center px-4">Upload KML, KMZ, GeoJSON or Shapefile (.zip)</span>
-                <input type="file" className="hidden" accept=".zip,.kml,.kmz,.json,.geojson" onChange={handleFileUpload} />
-              </label>
-            ) : (
-              <div className="bg-slate-50 rounded-xl p-4 border border-slate-100 flex items-center justify-between">
-                <div className="flex items-center gap-3">
-                  <div className="w-8 h-8 bg-blue-100 rounded-lg flex items-center justify-center">
-                    <MapIcon className="w-4 h-4 text-blue-600" />
-                  </div>
-                  <div>
-                    <p className="text-xs font-medium text-slate-900">Area Loaded</p>
-                    <p className="text-[10px] text-slate-400 font-mono">{stats?.area} km²</p>
-                  </div>
+            
+            {/* Upload Button */}
+            <label className="flex flex-col items-center justify-center w-full h-24 border-2 border-dashed border-slate-200 rounded-xl cursor-pointer hover:border-blue-400/50 hover:bg-slate-50 transition-all group mb-3">
+              <Upload className="w-6 h-6 text-slate-300 group-hover:text-blue-600 transition-colors mb-1" />
+              <span className="text-xs text-slate-400 group-hover:text-slate-600 text-center px-4">
+                {uploadedFiles.length === 0 ? 'Upload Multiple Files' : 'Add More Files'}
+              </span>
+              <span className="text-[10px] text-slate-300 mt-0.5">KML, KMZ, GeoJSON or Shapefile</span>
+              <input 
+                type="file" 
+                className="hidden" 
+                accept=".zip,.kml,.kmz,.json,.geojson" 
+                onChange={handleFileUpload} 
+                multiple 
+              />
+            </label>
+
+            {/* Uploaded Files List */}
+            {uploadedFiles.length > 0 && (
+              <div className="space-y-2">
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-[10px] text-slate-400 uppercase tracking-widest font-mono">
+                    {uploadedFiles.length} file{uploadedFiles.length !== 1 ? 's' : ''} uploaded
+                  </span>
+                  {uploadedFiles.length > 1 && (
+                    <button 
+                      onClick={handleClearAll}
+                      className="text-[9px] text-red-500 hover:text-red-600 uppercase tracking-wider font-bold transition-colors"
+                    >
+                      Clear All
+                    </button>
+                  )}
                 </div>
-                <button 
-                  onClick={() => setGeoJson(null)}
-                  className="p-2 hover:bg-red-50 rounded-lg text-slate-300 hover:text-red-500 transition-colors"
-                >
-                  <Trash2 className="w-4 h-4" />
-                </button>
+                <div className="space-y-2 max-h-48 overflow-y-auto">
+                  {uploadedFiles.map(file => (
+                    <div key={file.id} className="bg-slate-50 rounded-lg p-3 border border-slate-100 flex items-center justify-between group hover:border-slate-200 transition-all">
+                      <div className="flex items-center gap-2 flex-1 min-w-0">
+                        <div className="w-6 h-6 bg-blue-100 rounded flex items-center justify-center shrink-0">
+                          <MapIcon className="w-3 h-3 text-blue-600" />
+                        </div>
+                        <div className="min-w-0 flex-1">
+                          <p className="text-xs font-medium text-slate-900 truncate">{file.name}</p>
+                          <p className="text-[9px] text-slate-400">
+                            {file.geoJson.features.length} feature{file.geoJson.features.length !== 1 ? 's' : ''}
+                          </p>
+                        </div>
+                      </div>
+                      <button 
+                        onClick={() => handleRemoveFile(file.id)}
+                        className="p-1.5 hover:bg-red-50 rounded text-slate-300 hover:text-red-500 transition-colors opacity-0 group-hover:opacity-100"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+                
+                {/* Merged Area Info */}
+                {geoJson && stats && (
+                  <div className="bg-blue-50 rounded-lg p-3 border border-blue-100 mt-3">
+                    <div className="flex items-center gap-2">
+                      <Layers className="w-4 h-4 text-blue-600 shrink-0" />
+                      <div>
+                        <p className="text-xs font-medium text-blue-900">Merged Area</p>
+                        <p className="text-[10px] text-blue-600 font-mono">{stats?.area} km²</p>
+                      </div>
+                    </div>
+                  </div>
+                )}
               </div>
             )}
           </section>
@@ -1386,7 +1710,7 @@ export default function App() {
               </div>
             </div>
             <div className="mt-4 pt-4 border-t border-black/5">
-              <Logo light grayscale />
+              <Logo light grayscale size="small" />
             </div>
           </div>
         </div>

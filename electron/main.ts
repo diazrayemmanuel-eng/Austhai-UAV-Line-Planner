@@ -67,8 +67,8 @@ const createWindow = () => {
   logMain('createWindow called');
 
   const iconPath = isDev
-    ? path.join(__dirname, '../public/icon.ico')
-    : path.join(process.resourcesPath, 'icon.ico');
+    ? path.join(__dirname, '../Austhai logo.jpg')
+    : path.join(process.resourcesPath, 'Austhai logo.jpg');
 
   mainWindow = new BrowserWindow({
     width: 1400,
