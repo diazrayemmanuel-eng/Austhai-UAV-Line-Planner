@@ -47,17 +47,3 @@ jobs:
             release/*.blockmap
             release/win-unpacked/**
           if-no-files-found: warn
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v1
-        if: github.ref == 'refs/heads/main'
-        with:
-          tag_name: v1.0.0-${{ github.run_number }}
-          name: Austhai UAV Line Planner v1.0.0 Build ${{ github.run_number }}
-          files: |
-            release/*.exe
-            release/*.blockmap
-          draft: false
-          prerelease: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
