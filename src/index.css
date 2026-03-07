@@ -30,3 +30,14 @@ body {
 ::-webkit-scrollbar-thumb:hover {
   background: #2563eb44;
 }
+
+/* Custom label markers - ensure they are clickable */
+.custom-label-marker {
+  cursor: pointer !important;
+  pointer-events: auto !important;
+}
+
+.custom-label-marker > div {
+  cursor: pointer !important;
+  pointer-events: auto !important;
+}

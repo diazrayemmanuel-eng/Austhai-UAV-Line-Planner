@@ -34,7 +34,17 @@ import {
   Activity,
   Loader2,
   Wifi,
-  WifiOff
+  WifiOff,
+  Home,
+  Crosshair,
+  Ruler,
+  StickyNote,
+  Copy,
+  Check,
+  MapPin,
+  BarChart3,
+  Moon,
+  Sun
 } from 'lucide-react';
 import { 
   LineChart, Line, XAxis, YAxis, CartesianGrid, 
@@ -60,7 +70,6 @@ interface PlanningSettings {
   tieLineColor: string;
   boundaryColor: string;
   swapDirections: boolean;
-  lineExtension: number; // meters
   gridOffsetX: number;   // meters
   gridOffsetY: number;   // meters
 }
@@ -91,12 +100,6 @@ interface MissionPoint {
   speed: number;
   action?: 'hover' | 'photo' | 'video_start' | 'video_stop';
   actionParam?: any;
-}
-
-interface CompletedLine {
-  id: string;
-  type: 'flight-line' | 'tie-line';
-  completedAt: number; // timestamp
 }
 
 // Drone specifications
@@ -214,198 +217,392 @@ function generateLines(
 // --- Helper Functions for New Features ---
 
 /**
- * Calculate flight mission statistics
+ * Calculate per-line flight statistics
  */
-function calculateMissionStats(
-  flightLines: FeatureCollection<LineString> | null,
-  tieLines: FeatureCollection<LineString> | null,
+function calculateLineStats(
+  line: Feature<LineString>,
   settings: FlightMissionSettings
 ) {
-  if (!flightLines || !tieLines) return null;
-
   const drone = DRONE_SPECS[settings.droneModel];
-  const flightDistance = turf.length(flightLines, { units: 'kilometers' });
-  const tieDistance = turf.length(tieLines, { units: 'kilometers' });
-  const totalDistance = flightDistance + tieDistance;
-
-  // Calculate flight time (distance / speed, converted from km to m and m/s)
-  const flightTimeMinutes = (totalDistance * 1000) / (settings.cruiseSpeed * 60);
+  
+  // Calculate line distance in kilometers
+  const lineDistance = turf.length(line, { units: 'kilometers' });
+  
+  // Calculate flight time for this line (distance / speed)
+  const flightTimeMinutes = (lineDistance * 1000) / (settings.cruiseSpeed * 60);
   
   // Add time for altitude changes (assume 2 m/s vertical speed)
   const altitudeTime = (settings.altitude + settings.returnToHomeAltitude) / (2 * 60);
   
   // Add safety buffer
-  const totalFlightTime = (flightTimeMinutes + altitudeTime) * (1 + settings.batteryUsageBuffer / 100);
+  const totalLineTime = (flightTimeMinutes + altitudeTime) * (1 + settings.batteryUsageBuffer / 100);
   
-  // Calculate number of batteries needed
-  const batteriesNeeded = Math.ceil(totalFlightTime / drone.maxFlightTime);
+  // Battery percentage needed for this line
+  const batteryPercentage = (totalLineTime / drone.maxFlightTime) * 100;
   
-  // Calculate power consumption (rough estimate: 70% average power draw)
-  const avgPowerDraw = (drone.batteryCapacity * 0.7) / drone.maxFlightTime; // Wh per minute
-  const totalPowerNeeded = totalFlightTime * avgPowerDraw;
+  // Power consumption for this line
+  const avgPowerDraw = (drone.batteryCapacity * 0.7) / drone.maxFlightTime;
+  const linePowerNeeded = totalLineTime * avgPowerDraw;
 
   return {
-    totalDistance: totalDistance.toFixed(2),
-    flightDistance: flightDistance.toFixed(2),
-    tieDistance: tieDistance.toFixed(2),
-    estimatedFlightTime: totalFlightTime.toFixed(1),
-    batteriesNeeded,
-    maxFlightTime: drone.maxFlightTime,
-    powerConsumption: totalPowerNeeded.toFixed(0)
+    distance: lineDistance.toFixed(2),
+    flightTime: totalLineTime.toFixed(1),
+    batteryPercentage: batteryPercentage.toFixed(1),
+    powerConsumption: linePowerNeeded.toFixed(0),
+    timeString: formatTime(totalLineTime)
   };
 }
 
 /**
- * Generate DJI Pilot Mission File
+ * Format time in hours and minutes
  */
-function generateDJIWaypoints(
-  flightLines: FeatureCollection<LineString>,
-  tieLines: FeatureCollection<LineString>,
-  altitude: number
-): string {
-  const waypoints: any[] = [];
-  let wpIndex = 0;
-
-  // Add home point
-  waypoints.push({
-    index: wpIndex++,
-    latitude: 0,
-    longitude: 0,
-    altitude: altitude
-  });
-
-  // Add flight line waypoints
-  flightLines.features.forEach(line => {
-    line.geometry.coordinates.forEach((coord, idx) => {
-      waypoints.push({
-        index: wpIndex++,
-        latitude: coord[1],
-        longitude: coord[0],
-        altitude: altitude,
-        speed: 15,
-        action: idx === line.geometry.coordinates.length - 1 ? 'photo' : 'none'
-      });
-    });
-  });
-
-  // Add tie line waypoints
-  tieLines.features.forEach(line => {
-    line.geometry.coordinates.forEach(coord => {
-      waypoints.push({
-        index: wpIndex++,
-        latitude: coord[1],
-        longitude: coord[0],
-        altitude: altitude
-      });
-    });
-  });
-
-  // Add return to home
-  waypoints.push({
-    index: wpIndex,
-    latitude: waypoints[0].latitude,
-    longitude: waypoints[0].longitude,
-    altitude: altitude,
-    action: 'return_to_home'
-  });
-
-  return JSON.stringify({ waypoints }, null, 2);
+function formatTime(minutes: number): string {
+  const hours = Math.floor(minutes / 60);
+  const mins = Math.round(minutes % 60);
+  if (hours > 0) {
+    return `${hours}h ${mins}m`;
+  }
+  return `${mins}m`;
 }
 
 /**
- * Generate Litchi Mission CSV
+ * Advanced flight time calculator with elevation, wind resistance, and payload
  */
-function generateLitchiMission(
-  flightLines: FeatureCollection<LineString>,
-  tieLines: FeatureCollection<LineString>,
-  altitude: number,
-  baseLat: number,
-  baseLon: number
-): string {
-  let csv = 'latitude,longitude,altitude(m),heading(deg),curvesize(m),rotationdir,speed(m/s),poi_latitude,poi_longitude,poi_altitude(m),photo_interval(s),action1,action2,action3\n';
+interface AdvancedFlightStats {
+  totalFlightTime: number; // minutes
+  climbTime: number;
+  cruiseTime: number;
+  descentTime: number;
+  hoverTime: number; // minutes spent hovering at waypoints
+  totalEnergyWh: number;
+  climbEnergyWh: number;
+  cruiseEnergyWh: number;
+  descentEnergyWh: number;
+  hoverEnergyWh: number; // energy consumed during hover/turns
+  batteryPercentage: number;
+  avgWindResistance: number; // m/s
+  elevationGain: number; // meters
+  elevationLoss: number; // meters
+  horizontalDistance: number; // meters (2D distance)
+  actualDistance3D: number; // meters (3D distance including terrain following)
+  terrainFollowingFactor: number; // ratio of 3D to 2D distance
+  numberOfWaypoints: number;
+  numberOfTurns: number;
+  terrainType: string; // "Flat", "Rolling", or "Rugged"
+  waypointSpacing: number; // meters - adaptive based on terrain
+}
+
+/**
+ * Calculate wind speed at a given altitude AGL
+ * Based on logarithmic wind profile and user-provided data
+ */
+function getWindSpeedAtAltitude(altitudeAGL: number, surfaceWindSpeed: number = 4.0): number {
+  // At 10m (standard weather measurement): surface wind
+  // At 30m AGL: 4.0-4.7 m/s (average 4.35)
+  // At 80m AGL: 4.5-7.3 m/s (average 5.9)
   
-  // Add flight and tie line waypoints
-  const allLines = [...flightLines.features, ...tieLines.features];
-  allLines.forEach((line, lineIdx) => {
-    line.geometry.coordinates.forEach((coord, idx) => {
-      const speed = lineIdx < flightLines.features.length ? 15 : 10; // Flight lines faster than tie lines
-      csv += `${coord[1]},${coord[0]},${altitude},0,0,0,${speed},0,0,0,${lineIdx % 2 === 0 ? 2 : 0},,\n`;
-    });
-  });
-
-  return csv;
+  // Use logarithmic wind profile with power law approximation
+  // v(z) = v_ref * (z/z_ref)^alpha where alpha ≈ 0.143 for open terrain
+  const referenceHeight = 10; // meters
+  const alpha = 0.143; // wind shear exponent for open terrain
+  
+  if (altitudeAGL < 10) altitudeAGL = 10; // minimum height for calculation
+  
+  const windAtAltitude = surfaceWindSpeed * Math.pow(altitudeAGL / referenceHeight, alpha);
+  
+  // Apply realistic bounds based on user specifications
+  if (altitudeAGL <= 30) {
+    return Math.min(Math.max(windAtAltitude, 4.0), 4.7);
+  } else if (altitudeAGL >= 80) {
+    return Math.min(Math.max(windAtAltitude, 4.5), 7.3);
+  } else {
+    // Linear interpolation between 30m and 80m
+    const factor = (altitudeAGL - 30) / (80 - 30);
+    const windAt30 = Math.min(Math.max(surfaceWindSpeed * Math.pow(30 / referenceHeight, alpha), 4.0), 4.7);
+    const windAt80 = Math.min(Math.max(surfaceWindSpeed * Math.pow(80 / referenceHeight, alpha), 4.5), 7.3);
+    return windAt30 + (windAt80 - windAt30) * factor;
+  }
 }
 
 /**
- * Fetch weather data from Open-Meteo API
+ * Calculate power consumption for drone with payload
+ * @param drone - Drone specifications
+ * @param verticalSpeed - Vertical speed in m/s (positive = climbing, negative = descending, 0 = cruise)
+ * @param horizontalSpeed - Horizontal speed in m/s
+ * @param altitude - Altitude AGL in meters
+ * @param surfaceWindSpeed - Wind speed at 10m AGL
+ * @param payloadKg - Payload weight in kg (default 1.2kg for mag arrow)
  */
-async function fetchWeatherData(latitude: number, longitude: number) {
+function calculatePowerConsumption(
+  drone: DroneSpec,
+  verticalSpeed: number,
+  horizontalSpeed: number,
+  altitude: number,
+  surfaceWindSpeed: number = 4.0,
+  payloadKg: number = 1.2
+): number {
+  // Base power consumption (hovering with no payload) - approximately 40% of max power
+  const basePowerWatts = (drone.batteryCapacity / (drone.maxFlightTime / 60)) * 0.4;
+  
+  // Payload effect: additional power needed to carry extra weight
+  // Roughly 3-5% increase per kg of payload for multirotor drones
+  const payloadFactor = 1 + (payloadKg * 0.04);
+  
+  // Climbing: significantly more power (50-100% increase)
+  // Descending: less power (can use negative thrust, 20-40% of hover)
+  let verticalPowerFactor = 1.0;
+  if (verticalSpeed > 0) {
+    // Climbing: exponential increase with climb rate
+    verticalPowerFactor = 1 + (verticalSpeed / 2.0) * 1.5; // 2 m/s climb = ~2.5x hover power
+  } else if (verticalSpeed < 0) {
+    // Descending: reduced power
+    verticalPowerFactor = 0.3 + Math.abs(verticalSpeed) * 0.05; // Gentle descent uses ~30-40% hover power
+  }
+  
+  // Horizontal speed factor: power increases with speed (drag increases quadratically)
+  // At cruise speed (15 m/s), roughly 1.2-1.4x hover power
+  const speedFactor = 1 + Math.pow(horizontalSpeed / drone.cruiseSpeed, 2) * 0.4;
+  
+  // Wind resistance at altitude: additional power needed to maintain course
+  const windAtAltitude = getWindSpeedAtAltitude(altitude, surfaceWindSpeed);
+  const windFactor = 1 + (windAtAltitude / 10) * 0.15; // Each 10 m/s wind adds ~15% power
+  
+  // Total power = base × payload × vertical × speed × wind
+  const totalPowerWatts = basePowerWatts * payloadFactor * verticalPowerFactor * speedFactor * windFactor;
+  
+  return totalPowerWatts;
+}
+
+/**
+ * Calculate advanced flight statistics for a line considering elevation, wind, and payload
+ */
+async function calculateAdvancedLineStats(
+  line: Feature<LineString>,
+  settings: FlightMissionSettings,
+  surfaceWindSpeed: number = 4.0
+): Promise<AdvancedFlightStats> {
+  const drone = DRONE_SPECS[settings.droneModel];
+  const coords = line.geometry.coordinates;
+  const lineString = turf.lineString(coords);
+  const totalDistance = turf.length(lineString, { units: 'meters' });
+  
+  // Fetch elevation profile for the line
+  // UAV mag survey optimal waypoint spacing: 10-20m (sweet spot)
+  // - Flat/rolling terrain: 20m spacing is acceptable
+  // - Rugged terrain: 10-15m for accurate terrain following
+  // - Too wide (>50m): drone shortcuts terrain, inconsistent AGL
+  // - Too tight (<2m): flight controller stuttering, motion noise
+  const waypointSpacing = 15; // meters - optimal for mag surveys
+  const numSegments = Math.max(10, Math.floor(totalDistance / waypointSpacing));
+  const points = [];
+  
+  for (let i = 0; i <= numSegments; i++) {
+    const dist = (totalDistance / numSegments) * i;
+    const point = turf.along(lineString, dist, { units: 'meters' });
+    points.push({
+      latitude: point.geometry.coordinates[1],
+      longitude: point.geometry.coordinates[0],
+      distance: dist
+    });
+  }
+  
+  // Fetch elevation data
+  let elevations: number[] = [];
   try {
-    const response = await fetch(
-      `https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}&current=temperature_2m,weather_code,wind_speed_10m,wind_direction_10m&temperature_unit=celsius&wind_speed_unit=kmh`
+    const res = await fetch('https://api.open-elevation.com/api/v1/lookup', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ 
+        locations: points.map(p => ({ latitude: p.latitude, longitude: p.longitude })) 
+      })
+    });
+    
+    if (res.ok) {
+      const data = await res.json();
+      elevations = data.results.map((r: any) => r.elevation);
+    } else {
+      // Fallback: assume relatively flat terrain with minor variations
+      elevations = points.map(() => 100 + Math.random() * 10);
+    }
+  } catch (error) {
+    console.error("Elevation fetch failed, using fallback:", error);
+    elevations = points.map(() => 100 + Math.random() * 10);
+  }
+  
+  // Analyze terrain ruggedness to determine optimal waypoint spacing for mag survey
+  // Calculate elevation variance to classify terrain type
+  const maxElev = Math.max(...elevations);
+  const minElev = Math.min(...elevations);
+  const elevRange = maxElev - minElev;
+  const elevVariance = elevRange / (totalDistance / 1000); // meters elevation change per km
+  
+  // Determine optimal waypoint spacing based on terrain ruggedness
+  // - Flat terrain (<20m/km): 20m spacing
+  // - Rolling terrain (20-50m/km): 15m spacing  
+  // - Rugged terrain (>50m/km): 10m spacing
+  let actualWaypointSpacing: number;
+  let terrainType: string;
+  
+  if (elevVariance < 20) {
+    actualWaypointSpacing = 20; // Flat to gently rolling
+    terrainType = "Flat";
+  } else if (elevVariance < 50) {
+    actualWaypointSpacing = 15; // Rolling terrain (default)
+    terrainType = "Rolling";
+  } else {
+    actualWaypointSpacing = 10; // Rugged/steep terrain
+    terrainType = "Rugged";
+  }
+  
+  // Calculate stats for each segment
+  let totalTime = 0;
+  let totalEnergy = 0;
+  let climbTime = 0, cruiseTime = 0, descentTime = 0, hoverTime = 0;
+  let climbEnergy = 0, cruiseEnergy = 0, descentEnergy = 0, hoverEnergy = 0;
+  let elevationGain = 0, elevationLoss = 0;
+  let actual3DDistance = 0; // Track actual distance including vertical displacement
+  
+  // Initial climb to mission altitude
+  const startElevation = elevations[0];
+  const climbToAltitude = settings.altitude;
+  const climbRate = 2.0; // m/s
+  const initialClimbTime = climbToAltitude / climbRate / 60; // minutes
+  const initialClimbPower = calculatePowerConsumption(drone, climbRate, 0, settings.altitude / 2, surfaceWindSpeed);
+  const initialClimbEnergy = (initialClimbPower / 1000) * (initialClimbTime / 60); // kWh to Wh
+  
+  totalTime += initialClimbTime;
+  totalEnergy += initialClimbEnergy;
+  climbTime += initialClimbTime;
+  climbEnergy += initialClimbEnergy;
+  
+  // Count waypoints and turns for hover energy calculation
+  // For UAV mag surveys, waypoints are placed every 10-20m for accurate terrain following
+  // This is NOT just the line endpoints, but the actual flight path waypoints
+  // Spacing is adaptive based on terrain ruggedness
+  const numberOfWaypoints = Math.floor(totalDistance / actualWaypointSpacing) + 1;
+  const numberOfTurns = Math.max(0, numberOfWaypoints - 2); // Turns at intermediate waypoints
+  
+  // Process each segment
+  for (let i = 0; i < numSegments; i++) {
+    const segmentDist = totalDistance / numSegments; // 2D horizontal distance
+    const elevDiff = elevations[i + 1] - elevations[i];
+    const droneAltitude = settings.altitude + elevations[i] - startElevation;
+    
+    // Calculate actual 3D distance (hypotenuse) for terrain following
+    // When flying at constant AGL, vertical displacement = elevation change
+    const segment3DDistance = Math.sqrt(
+      Math.pow(segmentDist, 2) + Math.pow(Math.abs(elevDiff), 2)
+    );
+    actual3DDistance += segment3DDistance;
+    
+    // Calculate segment time based on 3D distance
+    const horizontalSpeed = settings.cruiseSpeed;
+    const segmentTimeSeconds = segment3DDistance / horizontalSpeed;
+    const segmentTimeMinutes = segmentTimeSeconds / 60;
+    
+    // Determine vertical speed for terrain following
+    let verticalSpeed = 0;
+    if (Math.abs(elevDiff) > 1) { // Only consider elevation changes > 1m
+      verticalSpeed = elevDiff / segmentTimeSeconds;
+      // Limit to realistic vertical speeds while cruising
+      verticalSpeed = Math.max(-3, Math.min(3, verticalSpeed));
+    }
+    
+    // Calculate power for this segment with terrain following
+    const segmentPower = calculatePowerConsumption(
+      drone,
+      verticalSpeed,
+      horizontalSpeed,
+      droneAltitude,
+      surfaceWindSpeed,
+      1.2 // mag arrow payload
     );
     
-    if (!response.ok) throw new Error('Weather API failed');
+    const segmentEnergy = (segmentPower / 1000) * (segmentTimeMinutes / 60); // Wh
     
-    const data = await response.json();
-    const current = data.current;
+    totalTime += segmentTimeMinutes;
+    totalEnergy += segmentEnergy;
     
-    return {
-      windSpeed: current.wind_speed_10m / 3.6, // Convert km/h to m/s
-      windDirection: current.wind_direction_10m,
-      temperature: current.temperature_2m
-    };
-  } catch (error) {
-    console.error('Weather fetch error:', error);
-    return null;
+    // Categorize segment
+    if (verticalSpeed > 0.5) {
+      climbTime += segmentTimeMinutes;
+      climbEnergy += segmentEnergy;
+      elevationGain += Math.abs(elevDiff);
+    } else if (verticalSpeed < -0.5) {
+      descentTime += segmentTimeMinutes;
+      descentEnergy += segmentEnergy;
+      elevationLoss += Math.abs(elevDiff);
+    } else {
+      cruiseTime += segmentTimeMinutes;
+      cruiseEnergy += segmentEnergy;
+    }
   }
-}
-
-/**
- * Calculate optimal flight direction based on wind
- */
-function getOptimalFlightDirection(windDirection: number): number {
-  // Fly perpendicular to wind for maximum efficiency
-  return (windDirection + 90) % 360;
-}
-
-/**
- * Check regulatory compliance
- */
-function checkRegulatoryCompliance(
-  flightLines: FeatureCollection<LineString> | null,
-  altitude: number,
-  maxAltitude: number,
-  airportLat: number,
-  airportLon: number,
-  airportBuffer: number
-): { compliant: boolean; warnings: string[] } {
-  const warnings: string[] = [];
-
-  // Check altitude
-  if (altitude > maxAltitude) {
-    warnings.push(`Altitude ${altitude}m exceeds drone max ${maxAltitude}m`);
-  }
-
-  // Check airport proximity
-  if (flightLines) {
-    flightLines.features.forEach(line => {
-      line.geometry.coordinates.forEach(coord => {
-        const distance = turf.distance(
-          turf.point([airportLon, airportLat]),
-          turf.point(coord),
-          { units: 'meters' }
-        );
-        if (distance < airportBuffer) {
-          warnings.push(`Flight area ${Math.round(distance)}m from airport (${airportBuffer}m required)`);
-        }
-      });
-    });
-  }
-
+  
+  // Add hover/turn energy at waypoints
+  // Assume 2 seconds hover per waypoint and 1 second per turn (sharp direction change)
+  const hoverSecondsPerWaypoint = 2; // seconds
+  const turnSecondsPerTurn = 1; // seconds for deceleration/acceleration
+  const totalHoverSeconds = (numberOfWaypoints * hoverSecondsPerWaypoint) + (numberOfTurns * turnSecondsPerTurn);
+  const hoverTimeMinutes = totalHoverSeconds / 60;
+  
+  // Hovering consumes more power than cruising (need to maintain altitude with no forward momentum)
+  const hoverPower = calculatePowerConsumption(drone, 0, 0, settings.altitude, surfaceWindSpeed, 1.2);
+  const hoverEnergyWh = (hoverPower / 1000) * (hoverTimeMinutes / 60);
+  
+  totalTime += hoverTimeMinutes;
+  totalEnergy += hoverEnergyWh;
+  hoverTime = hoverTimeMinutes;
+  hoverEnergy = hoverEnergyWh;
+  
+  // Final descent back to landing
+  const descentFromAltitude = settings.returnToHomeAltitude || settings.altitude;
+  const descentRate = 2.0; // m/s
+  const finalDescentTime = descentFromAltitude / descentRate / 60; // minutes
+  const finalDescentPower = calculatePowerConsumption(drone, -descentRate, 0, descentFromAltitude / 2, surfaceWindSpeed);
+  const finalDescentEnergy = (finalDescentPower / 1000) * (finalDescentTime / 60);
+  
+  totalTime += finalDescentTime;
+  totalEnergy += finalDescentEnergy;
+  descentTime += finalDescentTime;
+  descentEnergy += finalDescentEnergy;
+  
+  // Apply safety buffer (20-25% reserve for safe landing)
+  const bufferFactor = 1 + (settings.batteryUsageBuffer / 100);
+  totalTime *= bufferFactor;
+  totalEnergy *= bufferFactor;
+  
+  // Calculate battery percentage
+  const batteryPercentage = (totalEnergy / drone.batteryCapacity) * 100;
+  
+  // Average wind resistance
+  const avgAltitude = settings.altitude;
+  const avgWindResistance = getWindSpeedAtAltitude(avgAltitude, surfaceWindSpeed);
+  
+  // Calculate terrain following factor (ratio of 3D to 2D distance)
+  const terrainFollowingFactor = actual3DDistance / totalDistance;
+  
   return {
-    compliant: warnings.length === 0,
-    warnings
+    totalFlightTime: totalTime,
+    climbTime,
+    cruiseTime,
+    descentTime,
+    hoverTime,
+    totalEnergyWh: totalEnergy,
+    climbEnergyWh: climbEnergy,
+    cruiseEnergyWh: cruiseEnergy,
+    descentEnergyWh: descentEnergy,
+    hoverEnergyWh: hoverEnergy,
+    batteryPercentage,
+    avgWindResistance,
+    elevationGain,
+    elevationLoss,
+    horizontalDistance: totalDistance,
+    actualDistance3D: actual3DDistance,
+    terrainFollowingFactor,
+    numberOfWaypoints,
+    numberOfTurns,
+    terrainType,
+    waypointSpacing: actualWaypointSpacing
   };
 }
 
@@ -429,7 +626,12 @@ const Logo = ({ className = "", grayscale = false, light = false, size = "large"
   );
 };
 
-function MapController({ bounds, onMapClick, setMapInstance }: { bounds: BBox | null, onMapClick?: (e: any) => void, setMapInstance?: (map: L.Map) => void }) {
+function MapController({ bounds, onMapClick, setMapInstance, onMouseMove }: { 
+  bounds: BBox | null, 
+  onMapClick?: (e: any) => void, 
+  setMapInstance?: (map: L.Map) => void,
+  onMouseMove?: (e: any) => void 
+}) {
   const map = useMap();
   
   useEffect(() => {
@@ -452,6 +654,13 @@ function MapController({ bounds, onMapClick, setMapInstance }: { bounds: BBox | 
     }
   }, [map, onMapClick]);
 
+  useEffect(() => {
+    if (onMouseMove) {
+      map.on('mousemove', onMouseMove);
+      return () => { map.off('mousemove', onMouseMove); };
+    }
+  }, [map, onMouseMove]);
+
   return null;
 }
 
@@ -463,7 +672,7 @@ interface UploadedFile {
 }
 
 export default function App() {
-  const [uploadedFiles, setUploadedFiles] = useState<UploadedFile[]>([]);
+
   const [geoJson, setGeoJson] = useState<FeatureCollection | null>(null);
   const [settings, setSettings] = useState<PlanningSettings>({
     flightLineSpacing: 25,
@@ -474,14 +683,14 @@ export default function App() {
     tieLineColor: '#64748b',    // slate-500
     boundaryColor: '#0f172a',   // slate-900
     swapDirections: false,
-    lineExtension: 0,
     gridOffsetX: 0,
     gridOffsetY: 0
   });
   const [isProcessing, setIsProcessing] = useState(false);
   const [showPreview, setShowPreview] = useState(false);
   const [fileName, setFileName] = useState<string>('');
-  const [exportFormat, setExportFormat] = useState<'geojson' | 'kml' | 'kmz' | 'csv'>('geojson');
+  const [exportFormat, setExportFormat] = useState<'geojson' | 'kml' | 'kmz' | 'csv' | 'preflight-kml' | 'preflight-kmz'>('geojson');
+  const [preflightFilePrefix, setPreflightFilePrefix] = useState<string>('');
   
   // Manual Editing State
   const [selectedLineId, setSelectedLineId] = useState<string | null>(null);
@@ -498,27 +707,39 @@ export default function App() {
   const [showFlightLines, setShowFlightLines] = useState(true);
   const [showTieLines, setShowTieLines] = useState(true);
   const [areaUnit, setAreaUnit] = useState<'m2' | 'km2' | 'hectare'>('km2');
+  const [uploadedFiles, setUploadedFiles] = useState<UploadedFile[]>([]);
   const [elevationProfile, setElevationProfile] = useState<{distance: number, elevation: number}[] | null>(null);
   const [isFetchingElevation, setIsFetchingElevation] = useState(false);
+  
+  // New features state
+  const [showLineLabels, setShowLineLabels] = useState(true);
+  const [homePoint, setHomePoint] = useState<{lat: number, lng: number} | null>(null);
+  const [cursorCoords, setCursorCoords] = useState<{lat: number, lng: number} | null>(null);
+  const [lineProgress, setLineProgress] = useState<Record<string, 'completed' | 'in-progress' | 'pending'>>({}); // Track completion status per line ID
+  const [measurementMode, setMeasurementMode] = useState<'off' | 'distance' | 'area'>('off');
+  const [measurementPoints, setMeasurementPoints] = useState<[number, number][]>([]);
+  const [notes, setNotes] = useState<Array<{id: string, lat: number, lng: number, text: string}>>([]);
+  const [isAddingNote, setIsAddingNote] = useState(false);
+  const [lineLabels, setLineLabels] = useState<Record<string, {start: string, end: string}>>({});
+  const [editingLabel, setEditingLabel] = useState<{lineId: string, position: 'start' | 'end', currentValue: string} | null>(null);
+  const [editingNote, setEditingNote] = useState<{lat: number, lng: number, currentValue: string} | null>(null);
+  const [darkMode, setDarkMode] = useState(() => {
+    const saved = localStorage.getItem('darkMode');
+    return saved ? JSON.parse(saved) : false;
+  });
 
-  // New feature states
-  const [flightMission, setFlightMission] = useState<FlightMissionSettings>({
+  // Default mission settings used for per-line calculations and exports
+  const defaultMissionSettings: FlightMissionSettings = {
     droneModel: 'M350',
     cruiseSpeed: 15,
     altitude: 100,
     returnToHomeAltitude: 50,
-    batteryUsageBuffer: 15
-  });
-  const [weatherData, setWeatherData] = useState<{windSpeed: number, windDirection: number, temperature: number} | null>(null);
-  const [isFetchingWeather, setIsFetchingWeather] = useState(false);
-  const [completedLines, setCompletedLines] = useState<CompletedLine[]>([]);
-  const [regulatorySettings, setRegulatorySettings] = useState({
-    altitudeLimit: 120, // meters AGL
-    nearestAirportLat: 0,
-    nearestAirportLon: 0,
-    airportProximity: 5000, // meters
-    requiresAuthorization: false
-  });
+    batteryUsageBuffer: 20 // 20-25% recommended for safe landing reserve
+  };
+
+  const [advancedFlightStats, setAdvancedFlightStats] = useState<AdvancedFlightStats | null>(null);
+  const [isFetchingAdvancedStats, setIsFetchingAdvancedStats] = useState(false);
+  const [showAdvancedStats, setShowAdvancedStats] = useState(false);
 
   const fetchElevationProfile = async (line: Feature<LineString>) => {
     setIsFetchingElevation(true);
@@ -568,12 +789,32 @@ export default function App() {
     }
   };
 
+  const fetchAdvancedFlightStats = async (line: Feature<LineString>) => {
+    setIsFetchingAdvancedStats(true);
+    try {
+      const surfaceWind = 4.0; // Default surface wind speed
+      const stats = await calculateAdvancedLineStats(line, defaultMissionSettings, surfaceWind);
+      setAdvancedFlightStats(stats);
+      setShowAdvancedStats(true);
+    } catch (error) {
+      console.error("Advanced stats calculation failed:", error);
+      alert("Failed to calculate advanced flight statistics. Please try again.");
+    } finally {
+      setIsFetchingAdvancedStats(false);
+    }
+  };
+
   useEffect(() => {
     if (selectedLineId) {
       const line = [...(flightLines?.features || []), ...(tieLines?.features || [])].find(f => f.id === selectedLineId);
       if (line) fetchElevationProfile(line as Feature<LineString>);
+      // Reset advanced stats when switching lines
+      setAdvancedFlightStats(null);
+      setShowAdvancedStats(false);
     } else {
       setElevationProfile(null);
+      setAdvancedFlightStats(null);
+      setShowAdvancedStats(false);
     }
   }, [selectedLineId]);
 
@@ -586,6 +827,63 @@ export default function App() {
     return () => window.removeEventListener('beforeinstallprompt', handler);
   }, []);
 
+  // Load progress, notes, and home point from localStorage
+  useEffect(() => {
+    try {
+      const savedProgress = localStorage.getItem('lineProgress');
+      const savedNotes = localStorage.getItem('surveyNotes');
+      const savedHome = localStorage.getItem('homePoint');
+      const savedLabels = localStorage.getItem('lineLabels');
+      
+      if (savedProgress) setLineProgress(JSON.parse(savedProgress));
+      if (savedNotes) setNotes(JSON.parse(savedNotes));
+      if (savedHome) setHomePoint(JSON.parse(savedHome));
+      if (savedLabels) setLineLabels(JSON.parse(savedLabels));
+    } catch (err) {
+      console.error('Failed to load saved data:', err);
+    }
+  }, []);
+
+  // Save progress to localStorage
+  useEffect(() => {
+    try {
+      localStorage.setItem('lineProgress', JSON.stringify(lineProgress));
+    } catch (err) {
+      console.error('Failed to save progress:', err);
+    }
+  }, [lineProgress]);
+
+  // Save notes to localStorage
+  useEffect(() => {
+    try {
+      localStorage.setItem('surveyNotes', JSON.stringify(notes));
+    } catch (err) {
+      console.error('Failed to save notes:', err);
+    }
+  }, [notes]);
+
+  // Save home point to localStorage
+  useEffect(() => {
+    try {
+      if (homePoint) {
+        localStorage.setItem('homePoint', JSON.stringify(homePoint));
+      } else {
+        localStorage.removeItem('homePoint');
+      }
+    } catch (err) {
+      console.error('Failed to save home point:', err);
+    }
+  }, [homePoint]);
+
+  // Save line labels to localStorage
+  useEffect(() => {
+    try {
+      localStorage.setItem('lineLabels', JSON.stringify(lineLabels));
+    } catch (err) {
+      console.error('Failed to save line labels:', err);
+    }
+  }, [lineLabels]);
+
   const handleInstall = async () => {
     if (!installPrompt) return;
     installPrompt.prompt();
@@ -595,60 +893,7 @@ export default function App() {
     }
   };
 
-  // Merge uploaded files into single GeoJSON
-  useEffect(() => {
-    if (uploadedFiles.length === 0) {
-      setGeoJson(null);
-      setFileName('');
-      return;
-    }
 
-    try {
-      // Collect all polygon features from all uploaded files
-      const allPolygons: Feature<Polygon | MultiPolygon>[] = [];
-      
-      uploadedFiles.forEach(file => {
-        const polys = file.geoJson.features.filter(
-          f => f.geometry.type === 'Polygon' || f.geometry.type === 'MultiPolygon'
-        ) as Feature<Polygon | MultiPolygon>[];
-        allPolygons.push(...polys);
-      });
-
-      if (allPolygons.length === 0) {
-        setGeoJson(null);
-        return;
-      }
-
-      // Merge all polygons into a single unified polygon using union
-      let mergedPolygon: Feature<Polygon | MultiPolygon> = allPolygons[0];
-      
-      for (let i = 1; i < allPolygons.length; i++) {
-        try {
-          const unionResult = turf.union(turf.featureCollection([mergedPolygon, allPolygons[i]]));
-          if (unionResult) {
-            mergedPolygon = unionResult as Feature<Polygon | MultiPolygon>;
-          }
-        } catch (err) {
-          console.warn(`Failed to merge polygon ${i}, including separately`, err);
-          // If union fails, just keep both polygons separate
-        }
-      }
-
-      // Create the merged FeatureCollection
-      const mergedGeoJson = turf.featureCollection([mergedPolygon]);
-      setGeoJson(mergedGeoJson as any);
-      
-      // Update filename to reflect multiple files
-      if (uploadedFiles.length === 1) {
-        setFileName(uploadedFiles[0].name);
-      } else {
-        setFileName(`${uploadedFiles.length} files merged`);
-      }
-    } catch (err) {
-      console.error("Error merging files:", err);
-      alert("Error merging uploaded files. Please ensure all files contain valid polygon data.");
-    }
-  }, [uploadedFiles]);
 
   // Reset manual edits when settings change
   useEffect(() => {
@@ -815,7 +1060,10 @@ export default function App() {
 
       // Add all successfully processed files to state
       if (newFiles.length > 0) {
-        setUploadedFiles(prev => [...prev, ...newFiles]);
+        if (newFiles.length > 0) {
+          setGeoJson(newFiles[0].geoJson);
+          setFileName(newFiles[0].name);
+        }
       }
 
     } catch (err: any) {
@@ -837,60 +1085,6 @@ export default function App() {
     setDeletedLineIds(new Set());
     setModifiedLines({});
     setSelectedLineId(null);
-  };
-
-  const handleFetchWeather = async () => {
-    if (!mainPolygon) return;
-    setIsFetchingWeather(true);
-    try {
-      const center = turf.center(mainPolygon);
-      const weather = await fetchWeatherData(
-        center.geometry.coordinates[1],
-        center.geometry.coordinates[0]
-      );
-      if (weather) {
-        setWeatherData(weather);
-      }
-    } catch (err) {
-      console.error('Weather fetch error:', err);
-    } finally {
-      setIsFetchingWeather(false);
-    }
-  };
-
-  const handleMarkLineComplete = (lineId: string, type: 'flight-line' | 'tie-line') => {
-    setCompletedLines(prev => {
-      const exists = prev.find(l => l.id === lineId);
-      if (exists) {
-        return prev.filter(l => l.id !== lineId);
-      }
-      return [...prev, { id: lineId, type, completedAt: Date.now() }];
-    });
-  };
-
-  const handleExportMission = (format: 'dji' | 'litchi') => {
-    if (!flightLines || !tieLines || !mainPolygon) return;
-    
-    const baseName = fileName ? fileName.split('.')[0] : 'drone-mission';
-    let content: string;
-    let filename: string;
-    let mimeType: string;
-
-    const center = turf.center(mainPolygon);
-    const baseCoords = center.geometry.coordinates;
-
-    if (format === 'dji') {
-      content = generateDJIWaypoints(flightLines, tieLines, flightMission.altitude);
-      filename = `${baseName}-dji.json`;
-      mimeType = 'application/json';
-    } else {
-      content = generateLitchiMission(flightLines, tieLines, flightMission.altitude, baseCoords[1], baseCoords[0]);
-      filename = `${baseName}-litchi.csv`;
-      mimeType = 'text/csv';
-    }
-
-    const blob = new Blob([content], { type: mimeType });
-    downloadBlob(blob, filename);
   };
 
   const latLngToUTM = (lat: number, lng: number) => {
@@ -933,7 +1127,6 @@ export default function App() {
     csv += '"Tie Line Spacing (m)","' + settings.tieLineSpacing + '"\n';
     csv += '"Flight Direction (deg)","' + settings.angle + '"\n';
     csv += '"Overlap (%)","' + settings.overlap + '"\n';
-    csv += '"Line Extension (m)","' + settings.lineExtension + '"\n';
     csv += '"Swap Directions","' + (settings.swapDirections ? 'Yes' : 'No') + '"\n';
     csv += '"Grid Offset X (m)","' + settings.gridOffsetX + '"\n';
     csv += '"Grid Offset Y (m)","' + settings.gridOffsetY + '"\n';
@@ -996,6 +1189,25 @@ export default function App() {
   const handleExport = async () => {
     if (!flightLines || !tieLines) return;
     const baseName = fileName ? fileName.split('.')[0] : 'drone-plan';
+    const sanitizeForFileName = (value: string) => value
+      .trim()
+      .replace(/[<>:"/\\|?*]+/g, '-')
+      .replace(/\s+/g, '-')
+      .replace(/-+/g, '-')
+      .replace(/^[-.]+|[-.]+$/g, '');
+    const preflightPrefix = sanitizeForFileName(preflightFilePrefix) || sanitizeForFileName(baseName) || 'drone-plan';
+    const sequentialName = (index: number) => {
+      const trailingNumberMatch = preflightPrefix.match(/^(.*?)(\d+)$/);
+      if (trailingNumberMatch) {
+        const stem = trailingNumberMatch[1];
+        const numberPart = trailingNumberMatch[2];
+        const nextValue = Number(numberPart) + index;
+        return `${stem}${String(nextValue).padStart(numberPart.length, '0')}`;
+      }
+
+      const sequence = String(index + 1).padStart(3, '0');
+      return `${preflightPrefix}-${sequence}`;
+    };
     
     if (exportFormat === 'csv') {
       // Generate both CSV files and zip them together
@@ -1008,6 +1220,72 @@ export default function App() {
       
       const content = await zip.generateAsync({ type: "blob" });
       downloadBlob(content, `${baseName}-plan.zip`);
+    } else if (exportFormat === 'preflight-kml' || exportFormat === 'preflight-kmz') {
+      const zip = new JSZip();
+      const lineExtension = exportFormat === 'preflight-kml' ? 'kml' : 'kmz';
+      let lineSequenceIndex = 0;
+
+      for (let i = 0; i < flightLines.features.length; i++) {
+        const feature = flightLines.features[i];
+        const lineFeature = {
+          ...feature,
+          properties: {
+            type: 'Flight Line',
+            category: 'flight-line',
+            lineNumber: i + 1,
+            name: `Flight Line ${i + 1}`,
+            stroke: settings.flightLineColor,
+            'stroke-width': 3,
+            'stroke-opacity': 1
+          }
+        };
+
+        const lineFileName = sequentialName(lineSequenceIndex);
+        const lineKml = generateKMLWithStyles(turf.featureCollection([lineFeature]), lineFileName);
+        lineSequenceIndex += 1;
+
+        if (exportFormat === 'preflight-kml') {
+          zip.file(`${lineFileName}.kml`, lineKml);
+        } else {
+          const singleKmz = new JSZip();
+          singleKmz.file('doc.kml', lineKml);
+          const kmzBuffer = await singleKmz.generateAsync({ type: 'uint8array' });
+          zip.file(`${lineFileName}.kmz`, kmzBuffer);
+        }
+      }
+
+      for (let i = 0; i < tieLines.features.length; i++) {
+        const feature = tieLines.features[i];
+        const lineFeature = {
+          ...feature,
+          properties: {
+            type: 'Tie Line',
+            category: 'tie-line',
+            lineNumber: i + 1,
+            name: `Tie Line ${i + 1}`,
+            stroke: settings.tieLineColor,
+            'stroke-width': 1.5,
+            'stroke-opacity': 0.8,
+            'stroke-dasharray': '4, 4'
+          }
+        };
+
+        const lineFileName = sequentialName(lineSequenceIndex);
+        const lineKml = generateKMLWithStyles(turf.featureCollection([lineFeature]), lineFileName);
+        lineSequenceIndex += 1;
+
+        if (exportFormat === 'preflight-kml') {
+          zip.file(`${lineFileName}.kml`, lineKml);
+        } else {
+          const singleKmz = new JSZip();
+          singleKmz.file('doc.kml', lineKml);
+          const kmzBuffer = await singleKmz.generateAsync({ type: 'uint8array' });
+          zip.file(`${lineFileName}.kmz`, kmzBuffer);
+        }
+      }
+
+      const content = await zip.generateAsync({ type: 'blob' });
+      downloadBlob(content, `${preflightPrefix}-pre-flight-lines-${lineExtension}.zip`);
     } else {
       const combined = getCombinedGeoJSON();
       
@@ -1015,11 +1293,11 @@ export default function App() {
         const blob = new Blob([JSON.stringify(combined)], { type: 'application/json' });
         downloadBlob(blob, `${baseName}-plan.geojson`);
       } else if (exportFormat === 'kml') {
-        const kmlContent = generateKMLWithStyles(combined);
+        const kmlContent = generateKMLWithStyles(combined, baseName);
         const blob = new Blob([kmlContent], { type: 'application/vnd.google-earth.kml+xml' });
         downloadBlob(blob, `${baseName}-plan.kml`);
       } else if (exportFormat === 'kmz') {
-        const kmlContent = generateKMLWithStyles(combined);
+        const kmlContent = generateKMLWithStyles(combined, baseName);
         const zip = new JSZip();
         zip.file("doc.kml", kmlContent);
         const content = await zip.generateAsync({ type: "blob" });
@@ -1085,7 +1363,7 @@ export default function App() {
     return turf.featureCollection(features);
   };
 
-  const generateKMLWithStyles = (geoJsonData: FeatureCollection) => {
+  const generateKMLWithStyles = (geoJsonData: FeatureCollection, documentName?: string) => {
     // Helper to convert hex color to KML color (aabbggrr format)
     const hexToKmlColor = (hex: string, opacity: number = 1) => {
       const alpha = Math.floor(opacity * 255).toString(16).padStart(2, '0');
@@ -1105,7 +1383,7 @@ export default function App() {
     let kml = '<?xml version="1.0" encoding="UTF-8"?>\n';
     kml += '<kml xmlns="http://www.opengis.net/kml/2.2">\n';
     kml += '<Document>\n';
-    kml += '  <name>Drone Line Plan</name>\n';
+    kml += `  <name>${documentName || 'Drone Line Plan'}</name>\n`;
     kml += '  <description>Generated by Austhai UAV Line Planner</description>\n\n';
 
     // Define styles for each line type with fixed colors
@@ -1241,37 +1519,82 @@ export default function App() {
     return kml;
   };
 
+  // Utility functions for new features
+  const copyToClipboard = (text: string) => {
+    navigator.clipboard.writeText(text).then(() => {
+      alert('Coordinates copied to clipboard!');
+    }).catch(err => {
+      console.error('Failed to copy:', err);
+    });
+  };
+
+  const calculateMeasurementDistance = () => {
+    if (measurementPoints.length < 2) return 0;
+    const line = turf.lineString(measurementPoints);
+    return turf.length(line, { units: 'meters' });
+  };
+
+  const calculateMeasurementArea = () => {
+    if (measurementPoints.length < 3) return 0;
+    try {
+      const polygon = turf.polygon([[...measurementPoints, measurementPoints[0]]]);
+      return turf.area(polygon);
+    } catch {
+      return 0;
+    }
+  };
+
+  const handleMapClick = (e: L.LeafletMouseEvent) => {
+    if (measurementMode === 'distance' || measurementMode === 'area') {
+      setMeasurementPoints(prev => [...prev, [e.latlng.lng, e.latlng.lat]]);
+    } else if (isAddingNote) {
+      setEditingNote({
+        lat: e.latlng.lat,
+        lng: e.latlng.lng,
+        currentValue: ''
+      });
+      setIsAddingNote(false);
+    } else if (homePoint === null && e.originalEvent.ctrlKey) {
+      // Ctrl+Click to set home point
+      setHomePoint({ lat: e.latlng.lat, lng: e.latlng.lng });
+    }
+  };
+
+  const clearMeasurement = () => {
+    setMeasurementPoints([]);
+    setMeasurementMode('off');
+  };
+
+  const toggleLineProgress = (lineId: string) => {
+    setLineProgress(prev => {
+      const current = prev[lineId] || 'pending';
+      const next = current === 'pending' ? 'in-progress' : current === 'in-progress' ? 'completed' : 'pending';
+      return { ...prev, [lineId]: next };
+    });
+  };
+
+  const getProgressColor = (lineId: string) => {
+    const status = lineProgress[lineId] || 'pending';
+    return status === 'completed' ? '#10b981' : status === 'in-progress' ? '#f59e0b' : undefined;
+  };
+
   const combinedGeoJSON = useMemo(() => getCombinedGeoJSON(), [flightLines, tieLines, mainPolygon, settings]);
-  
-  const missionStats = useMemo(() => calculateMissionStats(flightLines, tieLines, flightMission), [flightLines, tieLines, flightMission]);
-  
-  const regulatoryCompliance = useMemo(() => {
-    if (!mainPolygon) return null;
-    const drone = DRONE_SPECS[flightMission.droneModel];
-    return checkRegulatoryCompliance(
-      flightLines,
-      flightMission.altitude,
-      drone.maxAltitude,
-      regulatorySettings.nearestAirportLat,
-      regulatorySettings.nearestAirportLon,
-      regulatorySettings.airportProximity
-    );
-  }, [flightLines, flightMission, regulatorySettings, mainPolygon]);
-  
-  const completionStats = useMemo(() => {
-    if (!flightLines && !tieLines) return null;
-    const totalLines = (flightLines?.features.length || 0) + (tieLines?.features.length || 0);
-    const completed = completedLines.length;
-    return {
-      total: totalLines,
-      completed,
-      remaining: totalLines - completed,
-      percentage: totalLines > 0 ? Math.round((completed / totalLines) * 100) : 0
-    };
-  }, [flightLines, tieLines, completedLines]);
+
+  // Save dark mode preference
+  useEffect(() => {
+    localStorage.setItem('darkMode', JSON.stringify(darkMode));
+    if (darkMode) {
+      document.documentElement.classList.add('dark');
+    } else {
+      document.documentElement.classList.remove('dark');
+    }
+  }, [darkMode]);
 
   return (
-    <div className="flex h-screen w-full overflow-hidden bg-white text-slate-900">
+    <div className={cn(
+      "flex h-screen w-full overflow-hidden",
+      darkMode ? "bg-slate-900 text-slate-100" : "bg-white text-slate-900"
+    )}>
       {/* Preview Modal */}
       <AnimatePresence>
         {showPreview && (
@@ -1287,9 +1610,15 @@ export default function App() {
               initial={{ opacity: 0, scale: 0.95, y: 20 }}
               animate={{ opacity: 1, scale: 1, y: 0 }}
               exit={{ opacity: 0, scale: 0.95, y: 20 }}
-              className="relative w-full max-w-2xl bg-white border border-slate-200 rounded-3xl shadow-2xl overflow-hidden flex flex-col max-h-[80vh]"
+              className={cn(
+                "relative w-full max-w-2xl border rounded-3xl shadow-2xl overflow-hidden flex flex-col max-h-[80vh]",
+                darkMode ? "bg-slate-800 border-slate-700" : "bg-white border-slate-200"
+              )}
             >
-              <div className="p-6 border-b border-slate-100 flex items-center justify-between">
+              <div className={cn(
+                "p-6 border-b flex items-center justify-between",
+                darkMode ? "border-slate-700" : "border-slate-100"
+              )}>
                 <div className="flex items-center gap-4">
                   <Logo size="small" />
                   <div>
@@ -1369,16 +1698,228 @@ export default function App() {
           </div>
         )}
       </AnimatePresence>
+
+      {/* Edit Label Modal */}
+      <AnimatePresence>
+        {editingLabel && (
+          <div className="fixed inset-0 z-[2000] flex items-center justify-center p-6">
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setEditingLabel(null)}
+              className="absolute inset-0 bg-slate-900/40 backdrop-blur-sm"
+            />
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.95, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.95, y: 20 }}
+              className="relative w-full max-w-md bg-white border border-slate-200 rounded-3xl shadow-2xl overflow-hidden"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="p-6 border-b border-slate-100 flex items-center justify-between">
+                <div>
+                  <h2 className="text-lg font-bold text-slate-900 tracking-tight">Edit Label</h2>
+                  <p className="text-xs text-slate-400 font-mono uppercase tracking-widest">
+                    {editingLabel.lineId} - {editingLabel.position === 'start' ? 'Start Point' : 'End Point'}
+                  </p>
+                </div>
+                <button 
+                  onClick={() => setEditingLabel(null)}
+                  className="p-2 hover:bg-slate-50 rounded-full text-slate-400 hover:text-slate-900 transition-colors"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              <div className="p-6 space-y-4">
+                <div className="space-y-2">
+                  <label className="text-[10px] text-slate-400 uppercase tracking-widest font-mono">Label Text</label>
+                  <input
+                    type="text"
+                    autoFocus
+                    defaultValue={editingLabel.currentValue}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        const input = e.currentTarget;
+                        const newValue = input.value.trim();
+                        if (newValue) {
+                          setLineLabels(prev => ({
+                            ...prev,
+                            [editingLabel.lineId]: {
+                              ...prev[editingLabel.lineId],
+                              [editingLabel.position]: newValue
+                            }
+                          }));
+                          setEditingLabel(null);
+                        }
+                      } else if (e.key === 'Escape') {
+                        setEditingLabel(null);
+                      }
+                    }}
+                    className="w-full px-4 py-3 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent font-mono text-sm"
+                    placeholder="Enter label text"
+                  />
+                </div>
+              </div>
+
+              <div className="p-6 border-t border-slate-100 bg-slate-50 flex gap-3">
+                <button 
+                  onClick={() => setEditingLabel(null)}
+                  className="flex-1 px-6 py-3 rounded-xl border border-slate-200 text-slate-600 font-bold hover:bg-slate-100 transition-all"
+                >
+                  Cancel
+                </button>
+                <button 
+                  onClick={() => {
+                    const input = document.querySelector<HTMLInputElement>('.fixed input[type="text"]');
+                    const newValue = input?.value.trim();
+                    if (newValue) {
+                      setLineLabels(prev => ({
+                        ...prev,
+                        [editingLabel.lineId]: {
+                          ...prev[editingLabel.lineId],
+                          [editingLabel.position]: newValue
+                        }
+                      }));
+                      setEditingLabel(null);
+                    }
+                  }}
+                  className="flex-[2] bg-blue-600 hover:bg-blue-500 text-white font-bold py-3 rounded-xl transition-all shadow-lg shadow-blue-600/10"
+                >
+                  Save Label
+                </button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* Edit Note Modal */}
+      <AnimatePresence>
+        {editingNote && (
+          <div className="fixed inset-0 z-[2000] flex items-center justify-center p-6">
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setEditingNote(null)}
+              className="absolute inset-0 bg-slate-900/40 backdrop-blur-sm"
+            />
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.95, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.95, y: 20 }}
+              className="relative w-full max-w-md bg-white border border-slate-200 rounded-3xl shadow-2xl overflow-hidden"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="p-6 border-b border-slate-100 flex items-center justify-between">
+                <div>
+                  <h2 className="text-lg font-bold text-slate-900 tracking-tight">Add Note</h2>
+                  <p className="text-xs text-slate-400 font-mono uppercase tracking-widest">
+                    Map Annotation
+                  </p>
+                </div>
+                <button 
+                  onClick={() => setEditingNote(null)}
+                  className="p-2 hover:bg-slate-50 rounded-full text-slate-400 hover:text-slate-900 transition-colors"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              <div className="p-6 space-y-4">
+                <div className="space-y-2">
+                  <label className="text-[10px] text-slate-400 uppercase tracking-widest font-mono">Note Text</label>
+                  <textarea
+                    autoFocus
+                    rows={4}
+                    defaultValue={editingNote.currentValue}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+                        const textarea = e.currentTarget;
+                        const newValue = textarea.value.trim();
+                        if (newValue) {
+                          setNotes(prev => [...prev, {
+                            id: `note-${Date.now()}`,
+                            lat: editingNote.lat,
+                            lng: editingNote.lng,
+                            text: newValue
+                          }]);
+                          setEditingNote(null);
+                        }
+                      } else if (e.key === 'Escape') {
+                        setEditingNote(null);
+                      }
+                    }}
+                    className="w-full px-4 py-3 rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent text-sm resize-none"
+                    placeholder="Enter note text (Ctrl+Enter to save)"
+                  />
+                </div>
+              </div>
+
+              <div className="p-6 border-t border-slate-100 bg-slate-50 flex gap-3">
+                <button 
+                  onClick={() => setEditingNote(null)}
+                  className="flex-1 px-6 py-3 rounded-xl border border-slate-200 text-slate-600 font-bold hover:bg-slate-100 transition-all"
+                >
+                  Cancel
+                </button>
+                <button 
+                  onClick={() => {
+                    const textarea = document.querySelector<HTMLTextAreaElement>('.fixed textarea');
+                    const newValue = textarea?.value.trim();
+                    if (newValue) {
+                      setNotes(prev => [...prev, {
+                        id: `note-${Date.now()}`,
+                        lat: editingNote.lat,
+                        lng: editingNote.lng,
+                        text: newValue
+                      }]);
+                      setEditingNote(null);
+                    }
+                  }}
+                  className="flex-[2] bg-blue-600 hover:bg-blue-500 text-white font-bold py-3 rounded-xl transition-all shadow-lg shadow-blue-600/10"
+                >
+                  Add Note
+                </button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
       {/* Sidebar */}
-      <aside className="w-80 bg-white text-slate-900 flex flex-col border-r border-slate-200 z-20">
-        <div className="p-6 border-b border-slate-100 flex flex-col gap-4">
+      <aside className={cn(
+        "w-80 flex flex-col border-r z-20",
+        darkMode ? "bg-slate-800 text-slate-100 border-slate-700" : "bg-white text-slate-900 border-slate-200"
+      )}>
+        <div className={cn(
+          "p-6 border-b flex flex-col gap-4",
+          darkMode ? "border-slate-700" : "border-slate-100"
+        )}>
           <Logo className="mb-4" />
           <div className="text-center">
             <div className="flex items-center justify-center gap-2 mb-1">
-              <h1 className="text-lg font-semibold tracking-tight text-slate-900">Austhai UAV <span className="italic font-serif opacity-50 text-sm">Line planner</span></h1>
+              <h1 className={cn(
+                "text-lg font-semibold tracking-tight",
+                darkMode ? "text-slate-100" : "text-slate-900"
+              )}>Austhai UAV <span className="italic font-serif opacity-50 text-sm">Line planner</span></h1>
             </div>
             <p className="text-[9px] text-slate-400 font-medium -mt-1 mb-2">created by Ray Emmanuel B. Diaz</p>
-            <p className="text-[10px] text-slate-400 uppercase tracking-widest font-mono">Mission Control v1.0.0</p>
+            <p className="text-[10px] text-slate-400 uppercase tracking-widest font-mono">v1.0.0</p>
+            <button
+              onClick={() => setDarkMode(!darkMode)}
+              className={cn(
+                "mt-3 w-full py-2 rounded-lg flex items-center justify-center gap-2 transition-all text-xs font-medium",
+                darkMode 
+                  ? "bg-slate-700 hover:bg-slate-600 text-slate-100" 
+                  : "bg-slate-100 hover:bg-slate-200 text-slate-900"
+              )}
+            >
+              {darkMode ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
+              {darkMode ? 'Light Mode' : 'Dark Mode'}
+            </button>
           </div>
           {installPrompt ? (
             <button 
@@ -1393,14 +1934,23 @@ export default function App() {
 
         <div className="flex-1 overflow-y-auto p-6 space-y-8 scrollbar-hide">
           {/* Info Section */}
-          <section className="bg-blue-50 border border-blue-100 rounded-xl p-4">
+          <section className={cn(
+            "border rounded-xl p-4",
+            darkMode ? "bg-blue-900/20 border-blue-800/50" : "bg-blue-50 border-blue-100"
+          )}>
             <div className="flex gap-3">
               <Info className="w-4 h-4 text-blue-600 shrink-0 mt-0.5" />
               <div className="space-y-1">
-                <p className="text-[11px] text-blue-600/80 leading-relaxed">
-                  Supports <span className="font-bold text-blue-600">KML, KMZ, GeoJSON</span> and <span className="font-bold text-blue-600">Zipped Shapefiles</span> (.shp, .shx, .dbf).
+                <p className={cn(
+                  "text-[11px] leading-relaxed",
+                  darkMode ? "text-blue-400/80" : "text-blue-600/80"
+                )}>
+                  Supports <span className={cn("font-bold", darkMode ? "text-blue-400" : "text-blue-600")}>KML, KMZ, GeoJSON</span> and <span className={cn("font-bold", darkMode ? "text-blue-400" : "text-blue-600")}>Zipped Shapefiles</span> (.shp, .shx, .dbf).
                 </p>
-                <p className="text-[10px] text-blue-600/60 leading-relaxed">
+                <p className={cn(
+                  "text-[10px] leading-relaxed",
+                  darkMode ? "text-blue-400/60" : "text-blue-600/60"
+                )}>
                   Upload multiple files to automatically merge areas for unified line planning.
                 </p>
               </div>
@@ -1412,10 +1962,21 @@ export default function App() {
             <label className="block text-[10px] uppercase tracking-widest text-slate-400 mb-3 font-mono">1. Area of Interest</label>
             
             {/* Upload Button */}
-            <label className="flex flex-col items-center justify-center w-full h-24 border-2 border-dashed border-slate-200 rounded-xl cursor-pointer hover:border-blue-400/50 hover:bg-slate-50 transition-all group mb-3">
-              <Upload className="w-6 h-6 text-slate-300 group-hover:text-blue-600 transition-colors mb-1" />
-              <span className="text-xs text-slate-400 group-hover:text-slate-600 text-center px-4">
-                {uploadedFiles.length === 0 ? 'Upload Multiple Files' : 'Add More Files'}
+            <label className={cn(
+              "flex flex-col items-center justify-center w-full h-24 border-2 border-dashed rounded-xl cursor-pointer transition-all group mb-3",
+              darkMode 
+                ? "border-slate-700 hover:border-blue-500/50 hover:bg-slate-700/50" 
+                : "border-slate-200 hover:border-blue-400/50 hover:bg-slate-50"
+            )}>
+              <Upload className={cn(
+                "w-6 h-6 transition-colors mb-1",
+                darkMode ? "text-slate-600 group-hover:text-blue-400" : "text-slate-300 group-hover:text-blue-600"
+              )} />
+              <span className={cn(
+                "text-xs text-center px-4",
+                darkMode ? "text-slate-400 group-hover:text-slate-300" : "text-slate-400 group-hover:text-slate-600"
+              )}>
+                Upload File
               </span>
               <span className="text-[10px] text-slate-300 mt-0.5">KML, KMZ, GeoJSON or Shapefile</span>
               <input 
@@ -1445,13 +2006,24 @@ export default function App() {
                 </div>
                 <div className="space-y-2 max-h-48 overflow-y-auto">
                   {uploadedFiles.map(file => (
-                    <div key={file.id} className="bg-slate-50 rounded-lg p-3 border border-slate-100 flex items-center justify-between group hover:border-slate-200 transition-all">
+                    <div key={file.id} className={cn(
+                      "rounded-lg p-3 border flex items-center justify-between group transition-all",
+                      darkMode 
+                        ? "bg-slate-700 border-slate-600 hover:border-slate-500" 
+                        : "bg-slate-50 border-slate-100 hover:border-slate-200"
+                    )}>
                       <div className="flex items-center gap-2 flex-1 min-w-0">
-                        <div className="w-6 h-6 bg-blue-100 rounded flex items-center justify-center shrink-0">
+                        <div className={cn(
+                          "w-6 h-6 rounded flex items-center justify-center shrink-0",
+                          darkMode ? "bg-blue-900/50" : "bg-blue-100"
+                        )}>
                           <MapIcon className="w-3 h-3 text-blue-600" />
                         </div>
                         <div className="min-w-0 flex-1">
-                          <p className="text-xs font-medium text-slate-900 truncate">{file.name}</p>
+                          <p className={cn(
+                            "text-xs font-medium truncate",
+                            darkMode ? "text-slate-200" : "text-slate-900"
+                          )}>{file.name}</p>
                           <p className="text-[9px] text-slate-400">
                             {file.geoJson.features.length} feature{file.geoJson.features.length !== 1 ? 's' : ''}
                           </p>
@@ -1459,7 +2031,12 @@ export default function App() {
                       </div>
                       <button 
                         onClick={() => handleRemoveFile(file.id)}
-                        className="p-1.5 hover:bg-red-50 rounded text-slate-300 hover:text-red-500 transition-colors opacity-0 group-hover:opacity-100"
+                        className={cn(
+                          "p-1.5 rounded transition-colors opacity-0 group-hover:opacity-100",
+                          darkMode 
+                            ? "hover:bg-red-900/20 text-slate-400 hover:text-red-400" 
+                            : "hover:bg-red-50 text-slate-300 hover:text-red-500"
+                        )}
                       >
                         <X className="w-3.5 h-3.5" />
                       </button>
@@ -1469,12 +2046,21 @@ export default function App() {
                 
                 {/* Merged Area Info */}
                 {geoJson && stats && (
-                  <div className="bg-blue-50 rounded-lg p-3 border border-blue-100 mt-3">
+                  <div className={cn(
+                    "rounded-lg p-3 border mt-3",
+                    darkMode ? "bg-blue-900/20 border-blue-800/50" : "bg-blue-50 border-blue-100"
+                  )}>
                     <div className="flex items-center gap-2">
                       <Layers className="w-4 h-4 text-blue-600 shrink-0" />
                       <div>
-                        <p className="text-xs font-medium text-blue-900">Merged Area</p>
-                        <p className="text-[10px] text-blue-600 font-mono">{stats?.area} km²</p>
+                        <p className={cn(
+                          "text-xs font-medium",
+                          darkMode ? "text-blue-400" : "text-blue-900"
+                        )}>Merged Area</p>
+                        <p className={cn(
+                          "text-[10px] font-mono",
+                          darkMode ? "text-blue-400" : "text-blue-600"
+                        )}>{stats?.area} km²</p>
                       </div>
                     </div>
                   </div>
@@ -1490,48 +2076,63 @@ export default function App() {
             <div className="space-y-4">
               <div>
                 <div className="flex justify-between mb-2">
-                  <label className="text-xs text-slate-600">Flight Line Spacing (m)</label>
+                  <label className={cn("text-xs", darkMode ? "text-slate-300" : "text-slate-600")}>Flight Line Spacing (m)</label>
                   <input 
                     type="number"
                     value={settings.flightLineSpacing}
                     onChange={(e) => setSettings(s => ({ ...s, flightLineSpacing: Number(e.target.value) }))}
-                    className="w-16 bg-slate-50 border border-slate-200 rounded px-1.5 py-0.5 text-xs font-mono text-blue-600 text-right focus:border-blue-500/50 outline-none"
+                    className={cn(
+                      "w-16 border rounded px-1.5 py-0.5 text-xs font-mono text-right focus:border-blue-500/50 outline-none",
+                      darkMode ? "bg-slate-700 border-slate-600 text-blue-400" : "bg-slate-50 border-slate-200 text-blue-600"
+                    )}
                   />
                 </div>
                 <input 
                   type="range" min="1" max="500" step="1"
                   value={settings.flightLineSpacing}
                   onChange={(e) => setSettings(s => ({ ...s, flightLineSpacing: Number(e.target.value) }))}
-                  className="w-full h-1.5 bg-slate-100 rounded-lg appearance-none cursor-pointer accent-blue-600"
+                  className={cn(
+                    "w-full h-1.5 rounded-lg appearance-none cursor-pointer accent-blue-600",
+                    darkMode ? "bg-slate-700" : "bg-slate-100"
+                  )}
                 />
               </div>
 
               <div>
                 <div className="flex justify-between mb-2">
-                  <label className="text-xs text-slate-600">Tie Line Spacing (m)</label>
+                  <label className={cn("text-xs", darkMode ? "text-slate-300" : "text-slate-600")}>Tie Line Spacing (m)</label>
                   <input 
                     type="number"
                     value={settings.tieLineSpacing}
                     onChange={(e) => setSettings(s => ({ ...s, tieLineSpacing: Number(e.target.value) }))}
-                    className="w-16 bg-slate-50 border border-slate-200 rounded px-1.5 py-0.5 text-xs font-mono text-blue-600 text-right focus:border-blue-500/50 outline-none"
+                    className={cn(
+                      "w-16 border rounded px-1.5 py-0.5 text-xs font-mono text-right focus:border-blue-500/50 outline-none",
+                      darkMode ? "bg-slate-700 border-slate-600 text-blue-400" : "bg-slate-50 border-slate-200 text-blue-600"
+                    )}
                   />
                 </div>
                 <input 
                   type="range" min="0" max="1000" step="1"
                   value={settings.tieLineSpacing}
                   onChange={(e) => setSettings(s => ({ ...s, tieLineSpacing: Number(e.target.value) }))}
-                  className="w-full h-1.5 bg-slate-100 rounded-lg appearance-none cursor-pointer accent-blue-600"
+                  className={cn(
+                    "w-full h-1.5 rounded-lg appearance-none cursor-pointer accent-blue-600",
+                    darkMode ? "bg-slate-700" : "bg-slate-100"
+                  )}
                 />
               </div>
 
               <div>
                 <div className="flex justify-between mb-2">
-                  <label className="text-xs text-slate-600">Orientation Angle (°)</label>
+                  <label className={cn("text-xs", darkMode ? "text-slate-300" : "text-slate-600")}>Orientation Angle (°)</label>
                   <input 
                     type="number"
                     value={settings.angle}
                     onChange={(e) => setSettings(s => ({ ...s, angle: Number(e.target.value) }))}
-                    className="w-16 bg-slate-50 border border-slate-200 rounded px-1.5 py-0.5 text-xs font-mono text-blue-600 text-right focus:border-blue-500/50 outline-none"
+                    className={cn(
+                      "w-16 border rounded px-1.5 py-0.5 text-xs font-mono text-right focus:border-blue-500/50 outline-none",
+                      darkMode ? "bg-slate-700 border-slate-600 text-blue-400" : "bg-slate-50 border-slate-200 text-blue-600"
+                    )}
                   />
                 </div>
                 <div className="flex gap-3 items-center">
@@ -1539,7 +2140,10 @@ export default function App() {
                     type="range" min="0" max="360" step="1"
                     value={settings.angle}
                     onChange={(e) => setSettings(s => ({ ...s, angle: Number(e.target.value) }))}
-                    className="flex-1 h-1.5 bg-slate-100 rounded-lg appearance-none cursor-pointer accent-blue-600"
+                    className={cn(
+                      "flex-1 h-1.5 rounded-lg appearance-none cursor-pointer accent-blue-600",
+                      darkMode ? "bg-slate-700" : "bg-slate-100"
+                    )}
                   />
                   <button 
                     onClick={() => setSettings(s => ({ ...s, swapDirections: !s.swapDirections }))}
@@ -1548,30 +2152,14 @@ export default function App() {
                       "p-2 rounded-lg border transition-all",
                       settings.swapDirections 
                         ? "bg-blue-500/20 border-blue-500/40 text-blue-600" 
-                        : "bg-slate-50 border-slate-200 text-slate-400 hover:text-slate-900 hover:bg-slate-100"
+                        : darkMode
+                          ? "bg-slate-700 border-slate-600 text-slate-400 hover:text-slate-200 hover:bg-slate-600"
+                          : "bg-slate-50 border-slate-200 text-slate-400 hover:text-slate-900 hover:bg-slate-100"
                     )}
                   >
                     <ArrowLeftRight className="w-4 h-4" />
                   </button>
                 </div>
-              </div>
-
-              <div className="pt-2 border-t border-slate-100">
-                <div className="flex justify-between mb-2">
-                  <label className="text-xs text-slate-600">Line Extension (m)</label>
-                  <input 
-                    type="number"
-                    value={settings.lineExtension}
-                    onChange={(e) => setSettings(s => ({ ...s, lineExtension: Number(e.target.value) }))}
-                    className="w-16 bg-slate-50 border border-slate-200 rounded px-1.5 py-0.5 text-xs font-mono text-blue-600 text-right focus:border-blue-500/50 outline-none"
-                  />
-                </div>
-                <input 
-                  type="range" min="0" max="100" step="1"
-                  value={settings.lineExtension}
-                  onChange={(e) => setSettings(s => ({ ...s, lineExtension: Number(e.target.value) }))}
-                  className="w-full h-1.5 bg-slate-100 rounded-lg appearance-none cursor-pointer accent-blue-600"
-                />
               </div>
 
               <div className="grid grid-cols-2 gap-4">
@@ -1581,7 +2169,10 @@ export default function App() {
                     type="number"
                     value={settings.gridOffsetX}
                     onChange={(e) => setSettings(s => ({ ...s, gridOffsetX: Number(e.target.value) }))}
-                    className="w-full bg-slate-50 border border-slate-200 rounded px-2 py-1 text-xs font-mono text-blue-600 focus:border-blue-500/50 outline-none"
+                    className={cn(
+                      "w-full border rounded px-2 py-1 text-xs font-mono focus:border-blue-500/50 outline-none",
+                      darkMode ? "bg-slate-700 border-slate-600 text-blue-400" : "bg-slate-50 border-slate-200 text-blue-600"
+                    )}
                   />
                 </div>
                 <div>
@@ -1590,7 +2181,10 @@ export default function App() {
                     type="number"
                     value={settings.gridOffsetY}
                     onChange={(e) => setSettings(s => ({ ...s, gridOffsetY: Number(e.target.value) }))}
-                    className="w-full bg-slate-50 border border-slate-200 rounded px-2 py-1 text-xs font-mono text-blue-600 focus:border-blue-500/50 outline-none"
+                    className={cn(
+                      "w-full border rounded px-2 py-1 text-xs font-mono focus:border-blue-500/50 outline-none",
+                      darkMode ? "bg-slate-700 border-slate-600 text-blue-400" : "bg-slate-50 border-slate-200 text-blue-600"
+                    )}
                   />
                 </div>
               </div>
@@ -1668,8 +2262,206 @@ export default function App() {
                 <span className="text-xs text-slate-600 flex-1">Show Tie Lines</span>
                 <div className="w-4 h-1 rounded-full" style={{ backgroundColor: settings.tieLineColor }} />
               </label>
+              <label className="flex items-center gap-3 cursor-pointer p-2 rounded-lg hover:bg-slate-50 transition-colors">
+                <input 
+                  type="checkbox" 
+                  checked={showLineLabels}
+                  onChange={(e) => setShowLineLabels(e.target.checked)}
+                  className="w-4 h-4 rounded border-slate-300 cursor-pointer"
+                />
+                <span className="text-xs text-slate-600 flex-1">Show Line Labels</span>
+                <MapPin className="w-3 h-3 text-slate-400" />
+              </label>
+              {Object.keys(lineLabels).length > 0 && (
+                <div className="px-2">
+                  <button
+                    onClick={() => setLineLabels({})}
+                    className="text-[9px] text-red-500 hover:text-red-600 uppercase tracking-wider font-bold transition-colors"
+                  >
+                    Reset All Labels
+                  </button>
+                </div>
+              )}
             </div>
           </section>
+
+          {/* Survey Tools Section */}
+          <section className={cn("space-y-3 pt-4 border-t border-slate-100 transition-opacity", !geoJson && "opacity-30 pointer-events-none")}>
+            <label className="block text-[10px] uppercase tracking-widest text-slate-400 font-mono flex items-center gap-2">
+              <BarChart3 className="w-3 h-3" />
+              Survey Tools
+            </label>
+            
+            <div className="space-y-2">
+              {/* Home Point */}
+              <div className="bg-slate-50 rounded-lg p-3 border border-slate-100">
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-xs text-slate-600 font-medium flex items-center gap-2">
+                    <Home className="w-3.5 h-3.5" />
+                    Home Point
+                  </span>
+                  {homePoint && (
+                    <button
+                      onClick={() => setHomePoint(null)}
+                      className="text-[9px] text-red-500 hover:text-red-600 uppercase tracking-wider font-bold"
+                    >
+                      Clear
+                    </button>
+                  )}
+                </div>
+                {homePoint ? (
+                  <div className="text-[10px] text-slate-500 font-mono">
+                    <div>{homePoint.lat.toFixed(6)}°, {homePoint.lng.toFixed(6)}°</div>
+                  </div>
+                ) : (
+                  <p className="text-[9px] text-slate-400 italic">Ctrl+Click map to set</p>
+                )}
+              </div>
+
+              {/* Measurement Tool */}
+              <div className="bg-slate-50 rounded-lg p-3 border border-slate-100">
+                <div className="flex items-center gap-2 mb-2">
+                  <Ruler className="w-3.5 h-3.5 text-slate-600" />
+                  <span className="text-xs text-slate-600 font-medium">Measurement</span>
+                </div>
+                <div className="flex gap-2 mb-2">
+                  <button
+                    onClick={() => setMeasurementMode(measurementMode === 'distance' ? 'off' : 'distance')}
+                    className={cn(
+                      "flex-1 px-2 py-1.5 rounded text-[10px] font-bold transition-all",
+                      measurementMode === 'distance'
+                        ? "bg-blue-600 text-white"
+                        : "bg-white border border-slate-200 text-slate-600 hover:bg-slate-50"
+                    )}
+                  >
+                    Distance
+                  </button>
+                  <button
+                    onClick={() => setMeasurementMode(measurementMode === 'area' ? 'off' : 'area')}
+                    className={cn(
+                      "flex-1 px-2 py-1.5 rounded text-[10px] font-bold transition-all",
+                      measurementMode === 'area'
+                        ? "bg-blue-600 text-white"
+                        : "bg-white border border-slate-200 text-slate-600 hover:bg-slate-50"
+                    )}
+                  >
+                    Area
+                  </button>
+                </div>
+                {measurementMode !== 'off' && (
+                  <div className="space-y-1">
+                    {measurementMode === 'distance' && measurementPoints.length >= 2 && (
+                      <p className="text-[10px] text-blue-600 font-mono font-bold">
+                        {calculateMeasurementDistance().toFixed(2)} m
+                      </p>
+                    )}
+                    {measurementMode === 'area' && measurementPoints.length >= 3 && (
+                      <p className="text-[10px] text-blue-600 font-mono font-bold">
+                        {calculateMeasurementArea().toFixed(2)} m²
+                      </p>
+                    )}
+                    <button
+                      onClick={clearMeasurement}
+                      className="text-[9px] text-red-500 hover:text-red-600 uppercase tracking-wider font-bold"
+                    >
+                      Clear
+                    </button>
+                  </div>
+                )}
+              </div>
+
+              {/* Notes */}
+              <div className="bg-slate-50 rounded-lg p-3 border border-slate-100">
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-xs text-slate-600 font-medium flex items-center gap-2">
+                    <StickyNote className="w-3.5 h-3.5" />
+                    Notes ({notes.length})
+                  </span>
+                  <button
+                    onClick={() => setIsAddingNote(!isAddingNote)}
+                    className={cn(
+                      "px-2 py-1 rounded text-[9px] font-bold transition-all",
+                      isAddingNote
+                        ? "bg-amber-600 text-white"
+                        : "bg-white border border-slate-200 text-slate-600 hover:bg-slate-50"
+                    )}
+                  >
+                    {isAddingNote ? 'Cancel' : 'Add'}
+                  </button>
+                </div>
+                {isAddingNote && (
+                  <p className="text-[9px] text-amber-600 italic">Click map to place note</p>
+                )}
+                {notes.length > 0 && (
+                  <button
+                    onClick={() => setNotes([])}
+                    className="text-[9px] text-red-500 hover:text-red-600 uppercase tracking-wider font-bold mt-1"
+                  >
+                    Clear All
+                  </button>
+                )}
+              </div>
+            </div>
+          </section>
+
+          {/* Statistics Dashboard */}
+          {flightLines && tieLines && stats && (
+            <section className="pt-4 border-t border-slate-100">
+              <label className="block text-[10px] uppercase tracking-widest text-slate-400 font-mono mb-3 flex items-center gap-2">
+                <BarChart3 className="w-3 h-3" />
+                Survey Statistics
+              </label>
+              
+              <div className="space-y-2">
+                <div className="bg-gradient-to-r from-blue-50 to-indigo-50 rounded-lg p-3 border border-blue-100">
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <p className="text-[9px] text-blue-600 uppercase font-mono mb-0.5">Flight Lines</p>
+                      <p className="text-lg font-bold text-blue-900">{flightLines.features.length}</p>
+                      <p className="text-[8px] text-blue-600 font-mono">{stats.flightLength} km</p>
+                    </div>
+                    <div>
+                      <p className="text-[9px] text-slate-600 uppercase font-mono mb-0.5">Tie Lines</p>
+                      <p className="text-lg font-bold text-slate-900">{tieLines.features.length}</p>
+                      <p className="text-[8px] text-slate-600 font-mono">{stats.tieLength} km</p>
+                    </div>
+                  </div>
+                </div>
+                
+                <div className="bg-slate-50 rounded-lg p-3 border border-slate-100">
+                  <p className="text-[9px] text-slate-400 uppercase font-mono mb-1">Total Distance</p>
+                  <p className="text-xl font-bold text-slate-900 font-mono">{stats.totalLength} <span className="text-xs opacity-50">km</span></p>
+                </div>
+
+                {/* Progress Summary */}
+                {Object.keys(lineProgress).length > 0 && (
+                  <div className="bg-gradient-to-r from-emerald-50 to-green-50 rounded-lg p-3 border border-emerald-100">
+                    <p className="text-[9px] text-emerald-600 uppercase font-mono mb-2">Progress</p>
+                    <div className="space-y-1">
+                      <div className="flex justify-between text-[10px]">
+                        <span className="text-green-600">✓ Completed</span>
+                        <span className="font-bold text-green-700">
+                          {Object.values(lineProgress).filter(s => s === 'completed').length}
+                        </span>
+                      </div>
+                      <div className="flex justify-between text-[10px]">
+                        <span className="text-amber-600">⚡ In Progress</span>
+                        <span className="font-bold text-amber-700">
+                          {Object.values(lineProgress).filter(s => s === 'in-progress').length}
+                        </span>
+                      </div>
+                      <div className="flex justify-between text-[10px]">
+                        <span className="text-slate-400">○ Pending</span>
+                        <span className="font-bold text-slate-600">
+                          {((flightLines?.features.length || 0) + (tieLines?.features.length || 0)) - Object.keys(lineProgress).length}
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </section>
+          )}
 
           {/* Area Measurement Section */}
           <section className={cn("space-y-3 pt-4 border-t border-slate-100 transition-opacity", !mainPolygon && "opacity-30 pointer-events-none")}>
@@ -1797,207 +2589,12 @@ export default function App() {
             )}
           </section>
 
-          {/* Stats Section */}
-          {stats && (
-            <section className="pt-4 border-t border-slate-100">
-              <label className="block text-[10px] uppercase tracking-widest text-slate-400 mb-4 font-mono">6. Mission Statistics</label>
-              <div className="grid grid-cols-2 gap-4">
-                <div className="bg-slate-50 rounded-xl p-3 border border-slate-100">
-                  <p className="text-[10px] text-slate-400 uppercase mb-1">Flight Dist</p>
-                  <p className="text-sm font-mono text-slate-900">{stats.flightLength} <span className="text-[10px] opacity-50">km</span></p>
-                </div>
-                <div className="bg-slate-50 rounded-xl p-3 border border-slate-100">
-                  <p className="text-[10px] text-slate-400 uppercase mb-1">Tie Dist</p>
-                  <p className="text-sm font-mono text-slate-900">{stats.tieLength} <span className="text-[10px] opacity-50">km</span></p>
-                </div>
-                <div className="col-span-2 bg-blue-50 rounded-xl p-3 border border-blue-100">
-                  <p className="text-[10px] text-blue-600/60 uppercase mb-1">Total Path Length</p>
-                  <p className="text-lg font-mono text-blue-600">{stats.totalLength} <span className="text-xs opacity-50">km</span></p>
-                </div>
-              </div>
-            </section>
-          )}
 
-          {/* Flight Mission Settings */}
-          {geoJson && (
-            <section className="pt-4 border-t border-slate-100 space-y-4">
-              <label className="block text-[10px] uppercase tracking-widest text-slate-400 mb-4 font-mono">7. Flight Mission Setup</label>
-              
-              <div>
-                <label className="text-xs text-slate-600 mb-2 block">Drone Model</label>
-                <select 
-                  value={flightMission.droneModel}
-                  onChange={(e) => setFlightMission(m => ({ ...m, droneModel: e.target.value as 'M350' | 'M400' }))}
-                  className="w-full bg-slate-50 border border-slate-200 rounded px-2 py-1.5 text-xs font-mono text-slate-900 focus:border-blue-500/50 outline-none"
-                >
-                  <option value="M350">DJI Matrice 350 RTK</option>
-                  <option value="M400">DJI Matrice 400 RTK</option>
-                </select>
-              </div>
 
-              <div>
-                <div className="flex justify-between mb-2">
-                  <label className="text-xs text-slate-600">Flight Altitude (m AGL)</label>
-                  <input 
-                    type="number"
-                    value={flightMission.altitude}
-                    onChange={(e) => setFlightMission(m => ({ ...m, altitude: Number(e.target.value) }))}
-                    className="w-16 bg-slate-50 border border-slate-200 rounded px-1.5 py-0.5 text-xs font-mono text-blue-600 text-right focus:border-blue-500/50 outline-none"
-                  />
-                </div>
-                <input 
-                  type="range" min="10" max="500" step="5"
-                  value={flightMission.altitude}
-                  onChange={(e) => setFlightMission(m => ({ ...m, altitude: Number(e.target.value) }))}
-                  className="w-full h-1.5 bg-slate-100 rounded-lg appearance-none cursor-pointer accent-blue-600"
-                />
-              </div>
 
-              <div>
-                <div className="flex justify-between mb-2">
-                  <label className="text-xs text-slate-600">Cruise Speed (m/s)</label>
-                  <input 
-                    type="number"
-                    value={flightMission.cruiseSpeed}
-                    onChange={(e) => setFlightMission(m => ({ ...m, cruiseSpeed: Number(e.target.value) }))}
-                    className="w-12 bg-slate-50 border border-slate-200 rounded px-1.5 py-0.5 text-xs font-mono text-blue-600 text-right focus:border-blue-500/50 outline-none"
-                  />
-                </div>
-                <input 
-                  type="range" min="5" max="25" step="0.5"
-                  value={flightMission.cruiseSpeed}
-                  onChange={(e) => setFlightMission(m => ({ ...m, cruiseSpeed: Number(e.target.value) }))}
-                  className="w-full h-1.5 bg-slate-100 rounded-lg appearance-none cursor-pointer accent-blue-600"
-                />
-              </div>
 
-              {missionStats && (
-                <div className="bg-gradient-to-br from-green-50 to-emerald-50 rounded-xl p-4 border border-green-100 space-y-3">
-                  <div className="flex justify-between text-xs">
-                    <span className="text-slate-600">Est. Flight Time</span>
-                    <span className="font-mono font-bold text-green-700">{missionStats.estimatedFlightTime} min</span>
-                  </div>
-                  <div className="flex justify-between text-xs">
-                    <span className="text-slate-600">Batteries Needed</span>
-                    <span className="font-mono font-bold text-green-700">{missionStats.batteriesNeeded}</span>
-                  </div>
-                  <div className="flex justify-between text-xs">
-                    <span className="text-slate-600">Total Distance</span>
-                    <span className="font-mono font-bold text-green-700">{missionStats.totalDistance} km</span>
-                  </div>
-                </div>
-              )}
-            </section>
-          )}
 
-          {/* Mission Export Section */}
-          {geoJson && missionStats && (
-            <section className="pt-4 border-t border-slate-100 space-y-3">
-              <label className="block text-[10px] uppercase tracking-widest text-slate-400 mb-3 font-mono">8. Export Mission</label>
-              <button 
-                onClick={() => handleExportMission('dji')}
-                className="w-full bg-purple-50 hover:bg-purple-100 text-purple-700 font-bold py-2 text-xs rounded-lg border border-purple-200 transition-all"
-              >
-                DJI Pilot (.json)
-              </button>
-              <button 
-                onClick={() => handleExportMission('litchi')}
-                className="w-full bg-amber-50 hover:bg-amber-100 text-amber-700 font-bold py-2 text-xs rounded-lg border border-amber-200 transition-all"
-              >
-                Litchi Mission (.csv)
-              </button>
-            </section>
-          )}
 
-          {/* Progress Tracking Section */}
-          {geoJson && completionStats && (
-            <section className="pt-4 border-t border-slate-100 space-y-3">
-              <label className="block text-[10px] uppercase tracking-widest text-slate-400 mb-3 font-mono">9. Progress Tracking</label>
-              <div className="space-y-2">
-                <div className="flex items-center justify-between">
-                  <span className="text-xs text-slate-600">Completion</span>
-                  <span className="text-xs font-bold text-slate-900">{completionStats.completed}/{completionStats.total}</span>
-                </div>
-                <div className="w-full bg-slate-100 rounded-full h-2 overflow-hidden">
-                  <div 
-                    className="bg-blue-600 h-full transition-all duration-300"
-                    style={{ width: `${completionStats.percentage}%` }}
-                  />
-                </div>
-                <p className="text-[10px] text-slate-400 text-center">{completionStats.percentage}% Complete • {completionStats.remaining} Remaining</p>
-              </div>
-            </section>
-          )}
-
-          {/* Weather Section */}
-          {geoJson && (
-            <section className="pt-4 border-t border-slate-100 space-y-3">
-              <div className="flex items-center justify-between">
-                <label className="text-[10px] uppercase tracking-widest text-slate-400 font-mono">10. Weather  Data</label>
-                <button 
-                  onClick={handleFetchWeather}
-                  disabled={isFetchingWeather}
-                  className="px-2 py-1 bg-cyan-50 hover:bg-cyan-100 disabled:opacity-50 text-cyan-700 text-[10px] font-bold rounded border border-cyan-200 transition-all"
-                >
-                  {isFetchingWeather ? 'Loading...' : 'Fetch'}
-                </button>
-              </div>
-              {weatherData && (
-                <div className="bg-cyan-50 rounded-xl p-3 border border-cyan-100 space-y-2">
-                  <div className="flex justify-between text-xs">
-                    <span className="text-slate-600">Wind Speed</span>
-                    <span className="font-mono font-bold">{weatherData.windSpeed.toFixed(1)} m/s</span>
-                  </div>
-                  <div className="flex justify-between text-xs">
-                    <span className="text-slate-600">Wind Direction</span>
-                    <span className="font-mono font-bold">{weatherData.windDirection}°</span>
-                  </div>
-                  <div className="flex justify-between text-xs">
-                    <span className="text-slate-600">Temperature</span>
-                    <span className="font-mono font-bold">{weatherData.temperature}°C</span>
-                  </div>
-                  <div className="pt-2 border-t border-cyan-200 text-[10px] text-cyan-700 font-medium">
-                    💡 Optimal flight direction: {getOptimalFlightDirection(weatherData.windDirection)}°
-                  </div>
-                </div>
-              )}
-            </section>
-          )}
-
-          {/* Regulatory Compliance Section */}
-          {geoJson && regulatoryCompliance && (
-            <section className="pt-4 border-t border-slate-100 space-y-3">
-              <label className="block text-[10px] uppercase tracking-widest text-slate-400 mb-3 font-mono">11. Regulatory Compliance</label>
-              
-              <div>
-                <label className="text-xs text-slate-600 mb-2 block">Max Altitude Limit (m)</label>
-                <input 
-                  type="number"
-                  value={regulatorySettings.altitudeLimit}
-                  onChange={(e) => setRegulatorySettings(r => ({ ...r, altitudeLimit: Number(e.target.value) }))}
-                  className="w-full bg-slate-50 border border-slate-200 rounded px-2 py-1 text-xs font-mono text-slate-900 focus:border-blue-500/50 outline-none"
-                />
-              </div>
-
-              <div className={cn(
-                "rounded-xl p-3 border",
-                regulatoryCompliance.compliant
-                  ? "bg-green-50 border-green-200"
-                  : "bg-red-50 border-red-200"
-              )}>
-                <p className={cn("text-xs font-bold mb-2", regulatoryCompliance.compliant ? "text-green-700" : "text-red-700")}>
-                  {regulatoryCompliance.compliant ? "✓ Compliant" : "⚠ Compliance Issues"}
-                </p>
-                {regulatoryCompliance.warnings.length > 0 && (
-                  <div className="space-y-1">
-                    {regulatoryCompliance.warnings.map((warning, idx) => (
-                      <p key={idx} className="text-[10px] text-slate-600">{warning}</p>
-                    ))}
-                  </div>
-                )}
-              </div>
-            </section>
-          )}
         </div>
 
         <div className="p-6 border-t border-slate-100 bg-slate-50 space-y-3">
@@ -2011,23 +2608,51 @@ export default function App() {
           </button>
           <div className="space-y-3">
             <label className="block text-[10px] uppercase tracking-widest text-slate-400 font-mono">Export Format</label>
-            <div className="grid grid-cols-4 gap-2">
-              {(['csv', 'geojson', 'kml', 'kmz'] as const).map((format) => (
+            <div className="grid grid-cols-3 gap-2">
+              {([
+                { value: 'csv', label: 'csv' },
+                { value: 'geojson', label: 'geojson' },
+                { value: 'kml', label: 'kml' },
+                { value: 'kmz', label: 'kmz' },
+                { value: 'preflight-kml', label: 'pre-kml' },
+                { value: 'preflight-kmz', label: 'pre-kmz' }
+              ] as const).map(({ value, label }) => (
                 <button
-                  key={format}
-                  onClick={() => setExportFormat(format)}
+                  key={value}
+                  onClick={() => setExportFormat(value)}
                   className={cn(
                     "py-2 rounded-lg text-[10px] font-bold uppercase tracking-wider transition-all border",
-                    exportFormat === format 
+                    exportFormat === value 
                       ? "bg-blue-600 border-blue-600 text-white" 
-                      : "bg-white border-slate-200 text-slate-400 hover:text-slate-900 hover:bg-slate-50"
+                      : darkMode
+                        ? "bg-slate-700 border-slate-600 text-slate-400 hover:text-slate-200 hover:bg-slate-600"
+                        : "bg-white border-slate-200 text-slate-400 hover:text-slate-900 hover:bg-slate-50"
                   )}
                 >
-                  {format}
+                  {label}
                 </button>
               ))}
             </div>
           </div>
+
+          {(exportFormat === 'preflight-kml' || exportFormat === 'preflight-kmz') && (
+            <div className="space-y-2">
+              <label className="block text-[10px] uppercase tracking-widest text-slate-400 font-mono">Pre-Flight File Prefix</label>
+              <input
+                type="text"
+                value={preflightFilePrefix}
+                onChange={(e) => setPreflightFilePrefix(e.target.value)}
+                placeholder="e.g. Mission-A"
+                className={cn(
+                  "w-full px-3 py-2 rounded-lg border text-[11px] font-mono focus:outline-none focus:ring-2 focus:ring-blue-500/30 focus:border-blue-400",
+                  darkMode ? "bg-slate-700 border-slate-600 text-slate-200" : "bg-white border-slate-200 text-slate-700"
+                )}
+              />
+              <p className="text-[9px] text-slate-400 font-mono">
+                Sequential output: {preflightFilePrefix.trim() || 'drone-plan'}{preflightFilePrefix.trim().match(/\d+$/) ? '' : '-001'}.{exportFormat === 'preflight-kml' ? 'kml' : 'kmz'}
+              </p>
+            </div>
+          )}
 
           <button 
             disabled={!geoJson}
@@ -2038,16 +2663,28 @@ export default function App() {
             Generate & Export
           </button>
           <p className="text-[9px] text-center text-slate-400 mt-4 uppercase tracking-tighter">
-            Exported as {exportFormat === 'csv' ? 'ZIP (2 CSV files - Summary & Line Details)' : exportFormat.toUpperCase() + ' (WGS84)'}
+            Exported as {exportFormat === 'csv'
+              ? 'ZIP (2 CSV files - Summary & Line Details)'
+              : exportFormat === 'preflight-kml'
+                ? 'ZIP (Individual KML per line, sequential names)'
+                : exportFormat === 'preflight-kmz'
+                  ? 'ZIP (Individual KMZ per line, sequential names)'
+                  : exportFormat.toUpperCase() + ' (WGS84)'}
           </p>
         </div>
       </aside>
 
       {/* Main Content */}
-      <main className="flex-1 relative bg-slate-50">
+      <main className={cn(
+        "flex-1 relative",
+        darkMode ? "bg-slate-800" : "bg-slate-50"
+      )}>
         {isProcessing && (
           <div className="absolute inset-0 z-[1000] bg-white/40 backdrop-blur-sm flex items-center justify-center">
-            <div className="bg-white text-slate-900 px-6 py-4 rounded-2xl shadow-2xl flex items-center gap-4 border border-slate-200">
+            <div className={cn(
+              "px-6 py-4 rounded-2xl shadow-2xl flex items-center gap-4 border",
+              darkMode ? "bg-slate-800 text-slate-100 border-slate-700" : "bg-white text-slate-900 border-slate-200"
+            )}>
               <div className="w-5 h-5 border-2 border-blue-600 border-t-transparent rounded-full animate-spin" />
               <p className="text-sm font-medium">Processing Geometry...</p>
             </div>
@@ -2086,14 +2723,17 @@ export default function App() {
 
           {flightLines && showFlightLines && (
             <GeoJSON 
-              key={`flight-${settings.flightLineSpacing}-${settings.angle}-${settings.flightLineColor}-${manualEditCounter}`}
+              key={`flight-${settings.flightLineSpacing}-${settings.angle}-${settings.flightLineColor}-${manualEditCounter}-${Object.keys(lineProgress).length}`}
               data={flightLines} 
-              style={(feature) => ({
-                color: selectedLineId === feature?.id ? '#ffffff' : settings.flightLineColor,
-                weight: selectedLineId === feature?.id ? 4 : 2,
-                opacity: 0.8,
-                cursor: isEditMode ? 'pointer' : 'default'
-              })}
+              style={(feature) => {
+                const progressColor = feature?.id ? getProgressColor(feature.id as string) : undefined;
+                return {
+                  color: selectedLineId === feature?.id ? '#ffffff' : progressColor || settings.flightLineColor,
+                  weight: selectedLineId === feature?.id ? 4 : 2,
+                  opacity: 0.8,
+                  cursor: isEditMode ? 'pointer' : 'default'
+                };
+              }}
               eventHandlers={{
                 click: (e) => {
                   if (isEditMode) {
@@ -2108,15 +2748,18 @@ export default function App() {
 
           {tieLines && showTieLines && (
             <GeoJSON 
-              key={`tie-${settings.tieLineSpacing}-${settings.angle}-${settings.tieLineColor}-${manualEditCounter}`}
+              key={`tie-${settings.tieLineSpacing}-${settings.angle}-${settings.tieLineColor}-${manualEditCounter}-${Object.keys(lineProgress).length}`}
               data={tieLines} 
-              style={(feature) => ({
-                color: selectedLineId === feature?.id ? '#ffffff' : settings.tieLineColor,
-                weight: selectedLineId === feature?.id ? 3 : 1.5,
-                opacity: 0.6,
-                dashArray: '4, 4',
-                cursor: isEditMode ? 'pointer' : 'default'
-              })}
+              style={(feature) => {
+                const progressColor = feature?.id ? getProgressColor(feature.id as string) : undefined;
+                return {
+                  color: selectedLineId === feature?.id ? '#ffffff' : progressColor || settings.tieLineColor,
+                  weight: selectedLineId === feature?.id ? 3 : 1.5,
+                  opacity: 0.6,
+                  dashArray: '4, 4',
+                  cursor: isEditMode ? 'pointer' : 'default'
+                };
+              }}
               eventHandlers={{
                 click: (e) => {
                   if (isEditMode) {
@@ -2178,9 +2821,187 @@ export default function App() {
             bounds={bbox} 
             setMapInstance={setMapInstance}
             onMapClick={(e: any) => {
-              if (isEditMode) setSelectedLineId(null);
+              if (isEditMode) {
+                setSelectedLineId(null);
+              } else {
+                handleMapClick(e);
+              }
+            }}
+            onMouseMove={(e: any) => {
+              setCursorCoords({ lat: e.latlng.lat, lng: e.latlng.lng });
             }}
           />
+
+          {/* Home Point Marker */}
+          {homePoint && (
+            <Marker
+              position={[homePoint.lat, homePoint.lng]}
+              icon={L.divIcon({
+                className: '',
+                html: '<div style="background: #ef4444; border: 3px solid white; border-radius: 50%; width: 20px; height: 20px; box-shadow: 0 2px 8px rgba(0,0,0,0.3);"></div>',
+                iconSize: [20, 20],
+                iconAnchor: [10, 10]
+              })}
+            >
+              <LeafletTooltip permanent direction="top" offset={[0, -10]}>
+                <span style={{fontSize: '10px', fontWeight: 'bold'}}>🏠 Home</span>
+              </LeafletTooltip>
+            </Marker>
+          )}
+
+          {/* Notes Markers */}
+          {notes.map(note => (
+            <Marker
+              key={note.id}
+              position={[note.lat, note.lng]}
+              icon={L.divIcon({
+                className: '',
+                html: '<div style="background: #fbbf24; border: 2px solid white; border-radius: 4px; width: 16px; height: 16px; box-shadow: 0 2px 6px rgba(0,0,0,0.3); display: flex; align-items: center; justify-center; font-size: 10px;">📝</div>',
+                iconSize: [16, 16],
+                iconAnchor: [8, 8]
+              })}
+            >
+              <LeafletTooltip direction="top" offset={[0, -8]}>
+                <div style={{maxWidth: '200px'}}>
+                  <div style={{fontSize: '10px', fontWeight: 'bold', marginBottom: '2px'}}>Note</div>
+                  <div style={{fontSize: '9px'}}>{note.text}</div>
+                  <button 
+                    onClick={() => setNotes(prev => prev.filter(n => n.id !== note.id))}
+                    style={{marginTop: '4px', fontSize: '8px', color: '#ef4444', cursor: 'pointer', background: 'none', border: 'none', textDecoration: 'underline'}}
+                  >
+                    Delete
+                  </button>
+                </div>
+              </LeafletTooltip>
+            </Marker>
+          ))}
+
+          {/* Measurement Points */}
+          {measurementPoints.map((point, idx) => (
+            <Marker
+              key={`measure-${idx}`}
+              position={[point[1], point[0]]}
+              icon={L.divIcon({
+                className: '',
+                html: `<div style="background: #3b82f6; border: 2px solid white; border-radius: 50%; width: 12px; height: 12px; box-shadow: 0 2px 4px rgba(0,0,0,0.3); display: flex; align-items: center; justify-center; font-size: 8px; color: white; font-weight: bold;">${idx + 1}</div>`,
+                iconSize: [12, 12],
+                iconAnchor: [6, 6]
+              })}
+            />
+          ))}
+
+          {/* Measurement Lines */}
+          {measurementMode !== 'off' && measurementPoints.length > 0 && (
+            <GeoJSON
+              key={`measurement-${measurementPoints.length}`}
+              data={{
+                type: 'FeatureCollection',
+                features: measurementMode === 'distance' && measurementPoints.length >= 2
+                  ? [turf.lineString(measurementPoints)]
+                  : measurementMode === 'area' && measurementPoints.length >= 3
+                  ? [turf.polygon([[...measurementPoints, measurementPoints[0]]])]
+                  : []
+              } as any}
+              style={{
+                color: '#3b82f6',
+                weight: 2,
+                fillColor: '#3b82f6',
+                fillOpacity: 0.1,
+                dashArray: '5, 5'
+              }}
+            />
+          )}
+
+          {/* Line Labels */}
+          {showLineLabels && flightLines && showFlightLines && (
+            <>
+              {flightLines.features.flatMap((feature, idx) => {
+                const coords = feature.geometry.coordinates;
+                const lineId = `FL-${idx + 1}`;
+                const labels = lineLabels[lineId] || { start: lineId, end: lineId };
+                
+                return [
+                  <Marker
+                    key={`fl-label-start-${idx}`}
+                    position={[coords[0][1], coords[0][0]]}
+                    icon={L.divIcon({
+                      className: 'custom-label-marker',
+                      html: `<div style="background: rgba(37, 99, 235, 0.9); color: white; padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: bold; white-space: nowrap; box-shadow: 0 2px 4px rgba(0,0,0,0.2); cursor: pointer;">${labels.start}</div>`,
+                      iconSize: [40, 20],
+                      iconAnchor: [20, 10]
+                    })}
+                    eventHandlers={{
+                      click: (e) => {
+                        L.DomEvent.stopPropagation(e);
+                        setEditingLabel({ lineId, position: 'start', currentValue: labels.start });
+                      }
+                    }}
+                  />,
+                  <Marker
+                    key={`fl-label-end-${idx}`}
+                    position={[coords[coords.length - 1][1], coords[coords.length - 1][0]]}
+                    icon={L.divIcon({
+                      className: 'custom-label-marker',
+                      html: `<div style="background: rgba(37, 99, 235, 0.9); color: white; padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: bold; white-space: nowrap; box-shadow: 0 2px 4px rgba(0,0,0,0.2); cursor: pointer;">${labels.end}</div>`,
+                      iconSize: [40, 20],
+                      iconAnchor: [20, 10]
+                    })}
+                    eventHandlers={{
+                      click: (e) => {
+                        L.DomEvent.stopPropagation(e);
+                        setEditingLabel({ lineId, position: 'end', currentValue: labels.end });
+                      }
+                    }}
+                  />
+                ];
+              })}
+            </>
+          )}
+
+          {showLineLabels && tieLines && showTieLines && (
+            <>
+              {tieLines.features.flatMap((feature, idx) => {
+                const coords = feature.geometry.coordinates;
+                const lineId = `TL-${idx + 1}`;
+                const labels = lineLabels[lineId] || { start: lineId, end: lineId };
+                
+                return [
+                  <Marker
+                    key={`tl-label-start-${idx}`}
+                    position={[coords[0][1], coords[0][0]]}
+                    icon={L.divIcon({
+                      className: 'custom-label-marker',
+                      html: `<div style="background: rgba(100, 116, 139, 0.9); color: white; padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: bold; white-space: nowrap; box-shadow: 0 2px 4px rgba(0,0,0,0.2); cursor: pointer;">${labels.start}</div>`,
+                      iconSize: [40, 20],
+                      iconAnchor: [20, 10]
+                    })}
+                    eventHandlers={{
+                      click: (e) => {
+                        L.DomEvent.stopPropagation(e);
+                        setEditingLabel({ lineId, position: 'start', currentValue: labels.start });
+                      }
+                    }}
+                  />,
+                  <Marker
+                    key={`tl-label-end-${idx}`}
+                    position={[coords[coords.length - 1][1], coords[coords.length - 1][0]]}
+                    icon={L.divIcon({
+                      className: 'custom-label-marker',
+                      html: `<div style="background: rgba(100, 116, 139, 0.9); color: white; padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: bold; white-space: nowrap; box-shadow: 0 2px 4px rgba(0,0,0,0.2); cursor: pointer;">${labels.end}</div>`,
+                      iconSize: [40, 20],
+                      iconAnchor: [20, 10]
+                    })}
+                    eventHandlers={{
+                      click: (e) => {
+                        L.DomEvent.stopPropagation(e);
+                        setEditingLabel({ lineId, position: 'end', currentValue: labels.end });
+                      }
+                    }}
+                  />
+                ];
+              })}
+            </>
+          )}
         </MapContainer>
 
         {/* Floating UI Elements */}
@@ -2248,6 +3069,62 @@ export default function App() {
           </div>
         </div>
 
+        {/* Coordinate Display */}
+        {cursorCoords && (
+          <div className="absolute bottom-6 left-6 z-[1000] bg-white/90 backdrop-blur-md p-3 rounded-xl shadow-lg border border-black/5">
+            <div className="flex items-center gap-2 mb-2">
+              <Crosshair className="w-3 h-3 text-slate-400" />
+              <span className="text-[9px] text-slate-400 uppercase tracking-wider font-mono">Coordinates</span>
+            </div>
+            <div className="space-y-1">
+              <div className="flex items-center justify-between gap-4">
+                <div>
+                  <p className="text-[8px] text-slate-400 uppercase">Lat, Lon</p>
+                  <p className="text-[10px] font-mono text-slate-900 font-bold">
+                    {cursorCoords.lat.toFixed(6)}°, {cursorCoords.lng.toFixed(6)}°
+                  </p>
+                </div>
+                <button
+                  onClick={() => copyToClipboard(`${cursorCoords.lat.toFixed(6)}, ${cursorCoords.lng.toFixed(6)}`)}
+                  className="p-1.5 hover:bg-blue-50 rounded text-slate-400 hover:text-blue-600 transition-colors"
+                  title="Copy coordinates"
+                >
+                  <Copy className="w-3 h-3" />
+                </button>
+              </div>
+              <div>
+                <p className="text-[8px] text-slate-400 uppercase">UTM</p>
+                <p className="text-[10px] font-mono text-slate-600">
+                  {latLngToUTM(cursorCoords.lat, cursorCoords.lng).easting}, {latLngToUTM(cursorCoords.lat, cursorCoords.lng).northing}
+                </p>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Progress Tracker for Selected Line */}
+        {selectedLineId && isEditMode && (
+          <div className="absolute top-24 right-6 z-[1000] bg-white/90 backdrop-blur-md p-3 rounded-xl shadow-lg border border-black/5">
+            <div className="flex items-center gap-2 mb-2">
+              <Check className="w-3 h-3 text-slate-400" />
+              <span className="text-[9px] text-slate-400 uppercase tracking-wider font-mono">Line Status</span>
+            </div>
+            <button
+              onClick={() => toggleLineProgress(selectedLineId)}
+              className={cn(
+                "w-full px-3 py-2 rounded-lg text-[10px] font-bold transition-all",
+                lineProgress[selectedLineId] === 'completed' ? "bg-green-100 text-green-700 border-2 border-green-300" :
+                lineProgress[selectedLineId] === 'in-progress' ? "bg-amber-100 text-amber-700 border-2 border-amber-300" :
+                "bg-slate-50 text-slate-600 border-2 border-slate-200 hover:bg-slate-100"
+              )}
+            >
+              {lineProgress[selectedLineId] === 'completed' ? '✓ Completed' :
+               lineProgress[selectedLineId] === 'in-progress' ? '⚡ In Progress' :
+               '○ Mark Status'}
+            </button>
+          </div>
+        )}
+
         {!geoJson && (
           <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
             <div className="bg-white/80 backdrop-blur-md p-8 rounded-3xl shadow-2xl border border-black/5 text-center max-w-md animate-in fade-in zoom-in duration-500">
@@ -2265,64 +3142,262 @@ export default function App() {
       </main>
       {/* Elevation Profile Panel */}
       <AnimatePresence>
-        {elevationProfile && (
+        {elevationProfile && selectedLineId && (
           <motion.div 
             initial={{ y: 300, opacity: 0 }}
             animate={{ y: 0, opacity: 1 }}
             exit={{ y: 300, opacity: 0 }}
-            className="absolute bottom-6 left-80 right-6 z-[1000] bg-white/90 backdrop-blur-md rounded-2xl shadow-2xl border border-slate-200 p-6 h-64 flex flex-col gap-4"
+            className="absolute bottom-6 left-80 right-6 z-[1000] bg-white/90 backdrop-blur-md rounded-2xl shadow-2xl border border-slate-200 p-6 flex flex-col gap-4 max-h-96 overflow-y-auto"
           >
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-3">
-                <Activity className="w-4 h-4 text-blue-600" />
-                <h3 className="text-xs font-bold text-slate-900 uppercase tracking-wider">Elevation Cross-Section Profile</h3>
-              </div>
-              <div className="flex items-center gap-4">
-                <span className="text-[8px] text-slate-400 uppercase font-mono">Source: Open-Elevation (SRTM)</span>
-                {isFetchingElevation && <Loader2 className="w-3 h-3 animate-spin text-blue-600" />}
-                <button 
-                  onClick={() => setElevationProfile(null)}
-                  className="p-1.5 hover:bg-slate-100 rounded-full text-slate-400 transition-colors"
-                >
-                  <X className="w-4 h-4" />
-                </button>
-              </div>
-            </div>
-            
-            <div className="flex-1 w-full min-h-0">
-              <ResponsiveContainer width="100%" height="100%">
-                <AreaChart data={elevationProfile}>
-                  <defs>
-                    <linearGradient id="colorElev" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="5%" stopColor="#2563eb" stopOpacity={0.3}/>
-                      <stop offset="95%" stopColor="#2563eb" stopOpacity={0}/>
-                    </linearGradient>
-                  </defs>
-                  <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
-                  <XAxis 
-                    dataKey="distance" 
-                    tick={{fontSize: 10, fill: '#64748b'}} 
-                    label={{ value: 'Distance (m)', position: 'insideBottom', offset: -5, fontSize: 10, fill: '#94a3b8' }}
-                  />
-                  <YAxis 
-                    tick={{fontSize: 10, fill: '#64748b'}}
-                    label={{ value: 'Elev (m)', angle: -90, position: 'insideLeft', fontSize: 10, fill: '#94a3b8' }}
-                  />
-                  <Tooltip 
-                    contentStyle={{ backgroundColor: 'white', borderRadius: '12px', border: '1px solid #e2e8f0', fontSize: '10px' }}
-                    labelFormatter={(val) => `Distance: ${val}m`}
-                  />
-                  <Area 
-                    type="monotone" 
-                    dataKey="elevation" 
-                    stroke="#2563eb" 
-                    strokeWidth={2}
-                    fillOpacity={1} 
-                    fill="url(#colorElev)" 
-                  />
-                </AreaChart>
-              </ResponsiveContainer>
-            </div>
+            {(() => {
+              const line = [...(flightLines?.features || []), ...(tieLines?.features || [])].find(f => f.id === selectedLineId);
+              const lineStats = line ? calculateLineStats(line as Feature<LineString>, defaultMissionSettings) : null;
+              const isFlightLine = flightLines?.features.some(f => f.id === selectedLineId);
+              
+              return (
+                <>
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-3">
+                      <Activity className="w-4 h-4 text-blue-600" />
+                      <div>
+                        <h3 className="text-xs font-bold text-slate-900 uppercase tracking-wider">
+                          {isFlightLine ? 'Flight Line' : 'Tie Line'} Details
+                        </h3>
+                        <p className="text-[10px] text-slate-400">Line ID: {selectedLineId}</p>
+                      </div>
+                    </div>
+                    <button 
+                      onClick={() => setElevationProfile(null)}
+                      className="p-1.5 hover:bg-slate-100 rounded-full text-slate-400 transition-colors"
+                    >
+                      <X className="w-4 h-4" />
+                    </button>
+                  </div>
+
+                  {lineStats && (
+                    <div className="grid grid-cols-4 gap-2 bg-gradient-to-r from-blue-50 to-slate-50 rounded-lg p-3 border border-blue-100">
+                      <div className="flex flex-col">
+                        <p className="text-[9px] text-slate-400 uppercase font-mono">Distance</p>
+                        <p className="text-sm font-bold text-slate-900">{lineStats.distance} <span className="text-[9px] opacity-60">km</span></p>
+                      </div>
+                      <div className="flex flex-col">
+                        <p className="text-[9px] text-slate-400 uppercase font-mono">Flight Time</p>
+                        <p className="text-sm font-bold text-blue-600">{lineStats.timeString}</p>
+                      </div>
+                      <div className="flex flex-col">
+                        <p className="text-[9px] text-slate-400 uppercase font-mono">Battery %</p>
+                        <p className="text-sm font-bold text-emerald-600">{lineStats.batteryPercentage}%</p>
+                      </div>
+                      <div className="flex flex-col">
+                        <p className="text-[9px] text-slate-400 uppercase font-mono">Power (Wh)</p>
+                        <p className="text-sm font-bold text-orange-600">{lineStats.powerConsumption}</p>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Advanced Flight Analysis Button */}
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={() => {
+                        if (!showAdvancedStats && line) {
+                          fetchAdvancedFlightStats(line as Feature<LineString>);
+                        } else {
+                          setShowAdvancedStats(!showAdvancedStats);
+                        }
+                      }}
+                      disabled={isFetchingAdvancedStats}
+                      className="flex-1 bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 disabled:from-slate-300 disabled:to-slate-400 text-white font-bold py-2.5 px-4 rounded-lg flex items-center justify-center gap-2 transition-all text-xs shadow-lg shadow-purple-600/20"
+                    >
+                      {isFetchingAdvancedStats ? (
+                        <>
+                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                          Calculating...
+                        </>
+                      ) : (
+                        <>
+                          <Activity className="w-3.5 h-3.5" />
+                          {advancedFlightStats ? 'Hide' : 'Advanced Flight Analysis'}
+                        </>
+                      )}
+                    </button>
+                  </div>
+
+                  {/* Advanced Stats Display */}
+                  {showAdvancedStats && advancedFlightStats && (
+                    <motion.div
+                      initial={{ height: 0, opacity: 0 }}
+                      animate={{ height: 'auto', opacity: 1 }}
+                      exit={{ height: 0, opacity: 0 }}
+                      className="space-y-3"
+                    >
+                      <div className="bg-gradient-to-br from-purple-50 via-indigo-50 to-blue-50 rounded-xl p-4 border border-purple-200 space-y-3">
+                        <h4 className="text-xs font-bold text-purple-900 uppercase tracking-wider flex items-center gap-2">
+                          <Activity className="w-3.5 h-3.5" />
+                          Advanced Flight Analysis (1.2kg Payload)
+                        </h4>
+                        
+                        {/* Time Breakdown */}
+                        <div className="grid grid-cols-5 gap-2">
+                          <div className="bg-white/60 rounded-lg p-2">
+                            <p className="text-[8px] text-slate-500 uppercase font-mono mb-0.5">Total Time</p>
+                            <p className="text-sm font-bold text-purple-700">{formatTime(advancedFlightStats.totalFlightTime)}</p>
+                          </div>
+                          <div className="bg-white/60 rounded-lg p-2">
+                            <p className="text-[8px] text-red-500 uppercase font-mono mb-0.5">Climb</p>
+                            <p className="text-xs font-bold text-red-600">{advancedFlightStats.climbTime.toFixed(1)}m</p>
+                          </div>
+                          <div className="bg-white/60 rounded-lg p-2">
+                            <p className="text-[8px] text-blue-500 uppercase font-mono mb-0.5">Cruise</p>
+                            <p className="text-xs font-bold text-blue-600">{advancedFlightStats.cruiseTime.toFixed(1)}m</p>
+                          </div>
+                          <div className="bg-white/60 rounded-lg p-2">
+                            <p className="text-[8px] text-green-500 uppercase font-mono mb-0.5">Descent</p>
+                            <p className="text-xs font-bold text-green-600">{advancedFlightStats.descentTime.toFixed(1)}m</p>
+                          </div>
+                          <div className="bg-white/60 rounded-lg p-2">
+                            <p className="text-[8px] text-yellow-600 uppercase font-mono mb-0.5">Hover</p>
+                            <p className="text-xs font-bold text-yellow-600">{advancedFlightStats.hoverTime.toFixed(1)}m</p>
+                          </div>
+                        </div>
+
+                        {/* Energy Breakdown */}
+                        <div className="grid grid-cols-5 gap-2">
+                          <div className="bg-white/60 rounded-lg p-2">
+                            <p className="text-[8px] text-slate-500 uppercase font-mono mb-0.5">Total Energy</p>
+                            <p className="text-sm font-bold text-orange-700">{advancedFlightStats.totalEnergyWh.toFixed(0)} Wh</p>
+                          </div>
+                          <div className="bg-white/60 rounded-lg p-2">
+                            <p className="text-[8px] text-red-500 uppercase font-mono mb-0.5">Climb</p>
+                            <p className="text-xs font-bold text-red-600">{advancedFlightStats.climbEnergyWh.toFixed(0)} Wh</p>
+                          </div>
+                          <div className="bg-white/60 rounded-lg p-2">
+                            <p className="text-[8px] text-blue-500 uppercase font-mono mb-0.5">Cruise</p>
+                            <p className="text-xs font-bold text-blue-600">{advancedFlightStats.cruiseEnergyWh.toFixed(0)} Wh</p>
+                          </div>
+                          <div className="bg-white/60 rounded-lg p-2">
+                            <p className="text-[8px] text-green-500 uppercase font-mono mb-0.5">Descent</p>
+                            <p className="text-xs font-bold text-green-600">{advancedFlightStats.descentEnergyWh.toFixed(0)} Wh</p>
+                          </div>
+                          <div className="bg-white/60 rounded-lg p-2">
+                            <p className="text-[8px] text-yellow-600 uppercase font-mono mb-0.5">Hover</p>
+                            <p className="text-xs font-bold text-yellow-600">{advancedFlightStats.hoverEnergyWh.toFixed(0)} Wh</p>
+                          </div>
+                        </div>
+
+                        {/* Terrain Following & Waypoints */}
+                        <div className="grid grid-cols-5 gap-2">
+                          <div className="bg-white/60 rounded-lg p-2">
+                            <p className="text-[8px] text-slate-500 uppercase font-mono mb-0.5">2D Distance</p>
+                            <p className="text-xs font-bold text-slate-700">{(advancedFlightStats.horizontalDistance / 1000).toFixed(2)} km</p>
+                          </div>
+                          <div className="bg-white/60 rounded-lg p-2">
+                            <p className="text-[8px] text-purple-600 uppercase font-mono mb-0.5">3D Distance</p>
+                            <p className="text-xs font-bold text-purple-700">{(advancedFlightStats.actualDistance3D / 1000).toFixed(2)} km</p>
+                          </div>
+                          <div className="bg-white/60 rounded-lg p-2">
+                            <p className="text-[8px] text-slate-500 uppercase font-mono mb-0.5">Terrain +</p>
+                            <p className="text-xs font-bold text-indigo-600">{((advancedFlightStats.terrainFollowingFactor - 1) * 100).toFixed(1)}%</p>
+                          </div>
+                          <div className="bg-white/60 rounded-lg p-2">
+                            <p className="text-[8px] text-slate-500 uppercase font-mono mb-0.5">Waypoints</p>
+                            <p className="text-xs font-bold text-blue-700">{advancedFlightStats.numberOfWaypoints}</p>
+                          </div>
+                          <div className="bg-white/60 rounded-lg p-2">
+                            <p className="text-[8px] text-slate-500 uppercase font-mono mb-0.5">Turns</p>
+                            <p className="text-xs font-bold text-cyan-700">{advancedFlightStats.numberOfTurns}</p>
+                          </div>
+                        </div>
+
+                        {/* Terrain Type & Waypoint Spacing */}
+                        <div className="grid grid-cols-2 gap-2">
+                          <div className="bg-gradient-to-r from-emerald-50 to-teal-50 rounded-lg p-2.5 border border-emerald-200">
+                            <p className="text-[8px] text-emerald-600 uppercase font-mono mb-0.5">Terrain Type</p>
+                            <p className="text-sm font-bold text-emerald-700">{advancedFlightStats.terrainType}</p>
+                            <p className="text-[7px] text-emerald-600 mt-0.5">
+                              {advancedFlightStats.terrainType === 'Flat' && 'Flat to gently rolling'}
+                              {advancedFlightStats.terrainType === 'Rolling' && 'Rolling terrain (typical)'}
+                              {advancedFlightStats.terrainType === 'Rugged' && 'Rugged/steep terrain'}
+                            </p>
+                          </div>
+                          <div className="bg-gradient-to-r from-blue-50 to-indigo-50 rounded-lg p-2.5 border border-blue-200">
+                            <p className="text-[8px] text-blue-600 uppercase font-mono mb-0.5">Waypoint Spacing</p>
+                            <p className="text-sm font-bold text-blue-700">{advancedFlightStats.waypointSpacing}m</p>
+                            <p className="text-[7px] text-blue-600 mt-0.5">Optimized for mag survey</p>
+                          </div>
+                        </div>
+
+                        {/* Battery & Environmental */}
+                        <div className="grid grid-cols-4 gap-2">
+                          <div className="bg-white/60 rounded-lg p-2">
+                            <p className="text-[8px] text-slate-500 uppercase font-mono mb-0.5">Battery Used</p>
+                            <p className="text-sm font-bold text-emerald-700">{advancedFlightStats.batteryPercentage.toFixed(1)}%</p>
+                          </div>
+                          <div className="bg-white/60 rounded-lg p-2">
+                            <p className="text-[8px] text-slate-500 uppercase font-mono mb-0.5">Wind @ Alt</p>
+                            <p className="text-xs font-bold text-cyan-600">{advancedFlightStats.avgWindResistance.toFixed(1)} m/s</p>
+                          </div>
+                          <div className="bg-white/60 rounded-lg p-2">
+                            <p className="text-[8px] text-slate-500 uppercase font-mono mb-0.5">Elev Gain</p>
+                            <p className="text-xs font-bold text-amber-600">+{advancedFlightStats.elevationGain.toFixed(0)}m</p>
+                          </div>
+                          <div className="bg-white/60 rounded-lg p-2">
+                            <p className="text-[8px] text-slate-500 uppercase font-mono mb-0.5">Elev Loss</p>
+                            <p className="text-xs font-bold text-teal-600">-{advancedFlightStats.elevationLoss.toFixed(0)}m</p>
+                          </div>
+                        </div>
+
+                        {/* Analysis Notes */}
+                        <div className="bg-white/40 rounded-lg p-2.5 border border-purple-200">
+                          <p className="text-[9px] text-slate-600 leading-relaxed">
+                            <span className="font-bold text-purple-700">📊 Mag Survey Analysis:</span> This calculation uses physics-based modeling optimized for UAV magnetometry: (1) <strong>Adaptive Waypoint Spacing</strong> - {advancedFlightStats.waypointSpacing}m spacing based on {advancedFlightStats.terrainType.toLowerCase()} terrain (flat: 20m, rolling: 15m, rugged: 10m) for optimal {advancedFlightStats.numberOfWaypoints} waypoints with consistent magnetic signal; (2) <strong>Terrain Following</strong> - 3D distance {((advancedFlightStats.terrainFollowingFactor - 1) * 100).toFixed(1)}% longer maintaining 50-88m AGL; (3) <strong>Hover/Turn Energy</strong> - 2s/waypoint + 1s/turn = {advancedFlightStats.hoverTime.toFixed(1)}min; (4) <strong>Phase Power</strong> - climb ~2.5x, descent ~35%; (5) <strong>Wind @ {defaultMissionSettings.altitude}m</strong> - {advancedFlightStats.avgWindResistance.toFixed(1)} m/s; (6) <strong>Battery</strong> - 20% reserve. Includes 1.2kg mag arrow payload.
+                          </p>
+                        </div>
+                      </div>
+                    </motion.div>
+                  )}
+
+                  <div className="flex items-center justify-between text-[10px] text-slate-500">
+                    <span>Elevation Profile ({isFetchingElevation ? 'Loading...' : 'Open-Elevation (SRTM)'})</span>
+                    {isFetchingElevation && <Loader2 className="w-3 h-3 animate-spin text-blue-600" />}
+                  </div>
+                  
+                  <div className="flex-1 w-full min-h-[200px]">
+                    <ResponsiveContainer width="100%" height="100%">
+                      <AreaChart data={elevationProfile}>
+                        <defs>
+                          <linearGradient id="colorElev" x1="0" y1="0" x2="0" y2="1">
+                            <stop offset="5%" stopColor="#2563eb" stopOpacity={0.3}/>
+                            <stop offset="95%" stopColor="#2563eb" stopOpacity={0}/>
+                          </linearGradient>
+                        </defs>
+                        <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
+                        <XAxis 
+                          dataKey="distance" 
+                          tick={{fontSize: 10, fill: '#64748b'}} 
+                          label={{ value: 'Distance (m)', position: 'insideBottom', offset: -5, fontSize: 10, fill: '#94a3b8' }}
+                        />
+                        <YAxis 
+                          tick={{fontSize: 10, fill: '#64748b'}}
+                          label={{ value: 'Elev (m)', angle: -90, position: 'insideLeft', fontSize: 10, fill: '#94a3b8' }}
+                        />
+                        <Tooltip 
+                          contentStyle={{ backgroundColor: 'white', borderRadius: '12px', border: '1px solid #e2e8f0', fontSize: '10px' }}
+                          labelFormatter={(val) => `Distance: ${val}m`}
+                        />
+                        <Area 
+                          type="monotone" 
+                          dataKey="elevation" 
+                          stroke="#2563eb" 
+                          strokeWidth={2}
+                          fillOpacity={1} 
+                          fill="url(#colorElev)" 
+                        />
+                      </AreaChart>
+                    </ResponsiveContainer>
+                  </div>
+                </>
+              );
+            })()}
           </motion.div>
         )}
       </AnimatePresence>
