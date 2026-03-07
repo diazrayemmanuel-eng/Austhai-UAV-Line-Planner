@@ -26,12 +26,12 @@ export default defineConfig(({mode}) => {
           display: 'standalone',
           icons: [
             {
-              src: 'https://picsum.photos/seed/drone/192/192',
-              sizes: '192x192',
+              src: '/icon.png',
+              sizes: '256x256',
               type: 'image/png'
             },
             {
-              src: 'https://picsum.photos/seed/drone/512/512',
+              src: '/icon.png',
               sizes: '512x512',
               type: 'image/png'
             }
