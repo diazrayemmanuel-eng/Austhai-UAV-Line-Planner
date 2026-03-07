@@ -23,7 +23,6 @@ import {
   Trash2,
   Maximize2,
   Navigation,
-  Eye,
   X,
   Palette,
   ArrowLeftRight,
@@ -687,7 +686,6 @@ export default function App() {
     gridOffsetY: 0
   });
   const [isProcessing, setIsProcessing] = useState(false);
-  const [showPreview, setShowPreview] = useState(false);
   const [fileName, setFileName] = useState<string>('');
   const [exportFormat, setExportFormat] = useState<'geojson' | 'kml' | 'kmz' | 'csv' | 'preflight-kml' | 'preflight-kmz'>('geojson');
   const [preflightFilePrefix, setPreflightFilePrefix] = useState<string>('');
@@ -743,117 +741,42 @@ export default function App() {
 
   const fetchElevationProfile = async (line: Feature<LineString>) => {
     setIsFetchingElevation(true);
+    const points: { distance: number; lat: number; lon: number }[] = [];
     try {
       const coords = line.geometry.coordinates;
       const lineString = turf.lineString(coords);
       const length = turf.length(lineString, { units: 'meters' });
-      const points = [];
       const numSamples = 20;
 
       for (let i = 0; i <= numSamples; i++) {
-        const dist = (length / numSamples) * i;
-        const point = turf.along(lineString, dist, { units: 'meters' });
-        points.push({
-          latitude: point.geometry.coordinates[1],
-          longitude: point.geometry.coordinates[0],
-          distance: Math.round(dist)
-        });
+        const distance = (length * i) / numSamples;
+        const samplePoint = turf.along(lineString, distance, { units: 'meters' });
+        const [lon, lat] = samplePoint.geometry.coordinates;
+        points.push({ distance, lat, lon });
       }
 
-      // Fetch from Open-Elevation
-      const res = await fetch('https://api.open-elevation.com/api/v1/lookup', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ locations: points.map(p => ({ latitude: p.latitude, longitude: p.longitude })) })
-      });
-      
-      if (res.ok) {
-        const data = await res.json();
-        const profile = data.results.map((r: any, idx: number) => ({
-          distance: points[idx].distance,
-          elevation: r.elevation
-        }));
-        setElevationProfile(profile);
-      } else {
-        // Fallback: Simulated elevation for demo
-        const profile = points.map((p, idx) => ({
-          distance: p.distance,
-          elevation: 100 + Math.sin(idx / 2) * 50 + Math.random() * 10
-        }));
-        setElevationProfile(profile);
+      const locations = points.map((p) => `${p.lat},${p.lon}`).join('|');
+      const response = await fetch(`https://api.open-elevation.com/api/v1/lookup?locations=${encodeURIComponent(locations)}`);
+
+      if (!response.ok) {
+        throw new Error(`Elevation API failed with status ${response.status}`);
       }
-    } catch (error) {
-      console.error("Elevation fetch failed:", error);
+
+      const data: { results?: Array<{ elevation?: number }> } = await response.json();
+      const profile = points.map((p, idx) => ({
+        distance: Math.round(p.distance),
+        elevation: Math.round(data.results?.[idx]?.elevation ?? 0)
+      }));
+      setElevationProfile(profile);
+    } catch (err) {
+      console.error('Failed to fetch elevation profile:', err);
+      // Fallback: keep chart usable even when API is unavailable.
+      setElevationProfile(points.map((p) => ({ distance: Math.round(p.distance), elevation: 0 })));
     } finally {
       setIsFetchingElevation(false);
     }
   };
 
-  const fetchAdvancedFlightStats = async (line: Feature<LineString>) => {
-    setIsFetchingAdvancedStats(true);
-    try {
-      const surfaceWind = 4.0; // Default surface wind speed
-      const stats = await calculateAdvancedLineStats(line, defaultMissionSettings, surfaceWind);
-      setAdvancedFlightStats(stats);
-      setShowAdvancedStats(true);
-    } catch (error) {
-      console.error("Advanced stats calculation failed:", error);
-      alert("Failed to calculate advanced flight statistics. Please try again.");
-    } finally {
-      setIsFetchingAdvancedStats(false);
-    }
-  };
-
-  useEffect(() => {
-    if (selectedLineId) {
-      const line = [...(flightLines?.features || []), ...(tieLines?.features || [])].find(f => f.id === selectedLineId);
-      if (line) fetchElevationProfile(line as Feature<LineString>);
-      // Reset advanced stats when switching lines
-      setAdvancedFlightStats(null);
-      setShowAdvancedStats(false);
-    } else {
-      setElevationProfile(null);
-      setAdvancedFlightStats(null);
-      setShowAdvancedStats(false);
-    }
-  }, [selectedLineId]);
-
-  useEffect(() => {
-    const handler = (e: any) => {
-      e.preventDefault();
-      setInstallPrompt(e);
-    };
-    window.addEventListener('beforeinstallprompt', handler);
-    return () => window.removeEventListener('beforeinstallprompt', handler);
-  }, []);
-
-  // Load progress, notes, and home point from localStorage
-  useEffect(() => {
-    try {
-      const savedProgress = localStorage.getItem('lineProgress');
-      const savedNotes = localStorage.getItem('surveyNotes');
-      const savedHome = localStorage.getItem('homePoint');
-      const savedLabels = localStorage.getItem('lineLabels');
-      
-      if (savedProgress) setLineProgress(JSON.parse(savedProgress));
-      if (savedNotes) setNotes(JSON.parse(savedNotes));
-      if (savedHome) setHomePoint(JSON.parse(savedHome));
-      if (savedLabels) setLineLabels(JSON.parse(savedLabels));
-    } catch (err) {
-      console.error('Failed to load saved data:', err);
-    }
-  }, []);
-
-  // Save progress to localStorage
-  useEffect(() => {
-    try {
-      localStorage.setItem('lineProgress', JSON.stringify(lineProgress));
-    } catch (err) {
-      console.error('Failed to save progress:', err);
-    }
-  }, [lineProgress]);
-
-  // Save notes to localStorage
   useEffect(() => {
     try {
       localStorage.setItem('surveyNotes', JSON.stringify(notes));
@@ -2598,14 +2521,6 @@ export default function App() {
         </div>
 
         <div className="p-6 border-t border-slate-100 bg-slate-50 space-y-3">
-          <button 
-            disabled={!geoJson}
-            onClick={() => setShowPreview(true)}
-            className="w-full bg-white hover:bg-slate-50 disabled:opacity-20 text-slate-600 font-bold py-4 rounded-xl flex items-center justify-center gap-2 transition-all border border-slate-200"
-          >
-            <Eye className="w-4 h-4" />
-            Preview Mission
-          </button>
           <div className="space-y-3">
             <label className="block text-[10px] uppercase tracking-widest text-slate-400 font-mono">Export Format</label>
             <div className="grid grid-cols-3 gap-2">
