@@ -12,32 +12,33 @@ export default defineConfig(({mode}) => {
     plugins: [
       react(), 
       tailwindcss(),
-      VitePWA({
-        registerType: 'autoUpdate',
-        devOptions: {
-          enabled: true
-        },
-        manifest: {
-          name: 'Austhai UAV Line Planner',
-          short_name: 'Austhai UAV',
-          description: 'Optimized drone flight planning and line generation tool.',
-          theme_color: '#2563eb',
-          background_color: '#ffffff',
-          display: 'standalone',
-          icons: [
-            {
-              src: '/icon.png',
-              sizes: '256x256',
-              type: 'image/png'
-            },
-            {
-              src: '/icon.png',
-              sizes: '512x512',
-              type: 'image/png'
-            }
-          ]
-        }
-      })
+      // Temporarily disabled PWA plugin due to memory issues
+      // VitePWA({
+      //   registerType: 'autoUpdate',
+      //   devOptions: {
+      //     enabled: true
+      //   },
+      //   manifest: {
+      //     name: 'Austhai UAV Line Planner',
+      //     short_name: 'Austhai UAV',
+      //     description: 'Optimized drone flight planning and line generation tool.',
+      //     theme_color: '#2563eb',
+      //     background_color: '#ffffff',
+      //     display: 'standalone',
+      //     icons: [
+      //       {
+      //         src: '/icon.png',
+      //         sizes: '256x256',
+      //         type: 'image/png'
+      //       },
+      //       {
+      //         src: '/icon.png',
+      //         sizes: '512x512',
+      //         type: 'image/png'
+      //       }
+      //     ]
+      //   }
+      // })
     ],
     define: {
       'process.env.GEMINI_API_KEY': JSON.stringify(env.GEMINI_API_KEY),

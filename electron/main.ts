@@ -6,6 +6,11 @@ import { pathToFileURL } from 'url';
 // Use Electron's built-in packaged check instead of external dependency.
 const isDev = !app.isPackaged;
 
+// Keep development cache/storage separate from installed app data.
+if (isDev) {
+  app.setPath('userData', path.join(app.getPath('appData'), 'droneline-planner-dev'));
+}
+
 // Emergency logging - write immediately on module load
 const emergencyLog = (msg: string) => {
   try {

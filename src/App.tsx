@@ -11,7 +11,8 @@ import shp from 'shpjs';
 import { kml } from '@tmcw/togeojson';
 import tokml from 'tokml';
 import JSZip from 'jszip';
-import type { Feature, Polygon, MultiPolygon, LineString, FeatureCollection, BBox } from 'geojson';
+import shpwrite from '@mapbox/shp-write';
+import type { Feature, Polygon, MultiPolygon, LineString, FeatureCollection, BBox, Point } from 'geojson';
 import { 
   Upload, 
   Settings2, 
@@ -670,6 +671,26 @@ interface UploadedFile {
   geoJson: FeatureCollection;
 }
 
+interface DgpsThresholdSettings {
+  ndviMax: number;
+  ndbiMin: number;
+  minElevation: number;
+}
+
+interface DgpsEditAction {
+  type: 'add-manual' | 'remove-manual' | 'remove-generated';
+  candidateId: string;
+  candidate: Feature<Point>;
+}
+
+interface DgpsValidationRecord {
+  candidateId: string;
+  score: number;
+  label: 'accepted' | 'rejected';
+  source: string;
+  timestamp: number;
+}
+
 export default function App() {
 
   const [geoJson, setGeoJson] = useState<FeatureCollection | null>(null);
@@ -687,7 +708,7 @@ export default function App() {
   });
   const [isProcessing, setIsProcessing] = useState(false);
   const [fileName, setFileName] = useState<string>('');
-  const [exportFormat, setExportFormat] = useState<'geojson' | 'kml' | 'kmz' | 'csv' | 'preflight-kml' | 'preflight-kmz'>('geojson');
+  const [exportFormat, setExportFormat] = useState<'geojson' | 'kml' | 'kmz' | 'csv' | 'preflight-kml' | 'preflight-kmz' | 'dgps-shp'>('geojson');
   const [preflightFilePrefix, setPreflightFilePrefix] = useState<string>('');
   
   // Manual Editing State
@@ -696,6 +717,10 @@ export default function App() {
   const [modifiedLines, setModifiedLines] = useState<Record<string, Feature<LineString>>>({});
   const [isEditMode, setIsEditMode] = useState(false);
   const [manualEditCounter, setManualEditCounter] = useState(0);
+  
+  // Imported Line Plans State
+  const [importedLineFeatures, setImportedLineFeatures] = useState<Feature<LineString>[]>([]);
+  const [importedLinesFileName, setImportedLinesFileName] = useState<string>('');
   const [installPrompt, setInstallPrompt] = useState<any>(null);
   const [basemap, setBasemap] = useState<'osm' | 'satellite' | 'offline'>('osm');
   const [offlineMode, setOfflineMode] = useState(false);
@@ -738,6 +763,28 @@ export default function App() {
   const [advancedFlightStats, setAdvancedFlightStats] = useState<AdvancedFlightStats | null>(null);
   const [isFetchingAdvancedStats, setIsFetchingAdvancedStats] = useState(false);
   const [showAdvancedStats, setShowAdvancedStats] = useState(false);
+
+  // DGPS candidate workflow state
+  const [showDgpsCandidates, setShowDgpsCandidates] = useState(true);
+  const [dgpsThresholds, setDgpsThresholds] = useState<DgpsThresholdSettings>({
+    ndviMax: 0.2,
+    ndbiMin: 0.1,
+    minElevation: 300
+  });
+  const [dgpsMaxCandidates, setDgpsMaxCandidates] = useState(15);
+  const [dgpsEditMode, setDgpsEditMode] = useState<'off' | 'add' | 'remove'>('off');
+  const [manualDgpsPoints, setManualDgpsPoints] = useState<Feature<Point>[]>([]);
+  const [removedGeneratedCandidateIds, setRemovedGeneratedCandidateIds] = useState<Set<string>>(new Set());
+  const [dgpsEditHistory, setDgpsEditHistory] = useState<DgpsEditAction[]>([]);
+  const [selectedDgpsCandidateId, setSelectedDgpsCandidateId] = useState<string | null>(null);
+  const [dgpsValidationRecords, setDgpsValidationRecords] = useState<Record<string, DgpsValidationRecord>>(() => {
+    try {
+      const raw = localStorage.getItem('dgpsValidationRecords');
+      return raw ? JSON.parse(raw) : {};
+    } catch {
+      return {};
+    }
+  });
 
   const fetchElevationProfile = async (line: Feature<LineString>) => {
     setIsFetchingElevation(true);
@@ -807,6 +854,14 @@ export default function App() {
     }
   }, [lineLabels]);
 
+  useEffect(() => {
+    try {
+      localStorage.setItem('dgpsValidationRecords', JSON.stringify(dgpsValidationRecords));
+    } catch (err) {
+      console.error('Failed to save DGPS validation records:', err);
+    }
+  }, [dgpsValidationRecords]);
+
   const handleInstall = async () => {
     if (!installPrompt) return;
     installPrompt.prompt();
@@ -869,15 +924,48 @@ export default function App() {
     return turf.featureCollection(finalFeatures);
   }, [mainPolygon, settings.tieLineSpacing, settings.angle, settings.swapDirections, deletedLineIds, modifiedLines]);
 
+  // When a line plan is imported, use it as the active plan and do not append auto-generated lines.
+  const allFlightLines = useMemo(() => {
+    const hasImportedPlan = importedLineFeatures.length > 0;
+    const generated = hasImportedPlan ? [] : (flightLines?.features || []);
+    const imported = importedLineFeatures.filter(f => {
+      const lineType = f.properties?.type?.toLowerCase();
+      return !lineType || lineType === 'flight' || lineType.startsWith('fl');
+    });
+    
+    // Apply edits to imported lines as well
+    const editedImported = imported
+      .filter(f => !deletedLineIds.has(String(f.id)))
+      .map(f => modifiedLines[String(f.id)] || f);
+    
+    return turf.featureCollection([...generated, ...editedImported]);
+  }, [flightLines, importedLineFeatures, deletedLineIds, modifiedLines]);
+
+  const allTieLines = useMemo(() => {
+    const hasImportedPlan = importedLineFeatures.length > 0;
+    const generated = hasImportedPlan ? [] : (tieLines?.features || []);
+    const imported = importedLineFeatures.filter(f => {
+      const lineType = f.properties?.type?.toLowerCase();
+      return lineType === 'tie' || lineType?.startsWith('tl');
+    });
+    
+    // Apply edits to imported lines as well
+    const editedImported = imported
+      .filter(f => !deletedLineIds.has(String(f.id)))
+      .map(f => modifiedLines[String(f.id)] || f);
+    
+    return turf.featureCollection([...generated, ...editedImported]);
+  }, [tieLines, importedLineFeatures, deletedLineIds, modifiedLines]);
+
   const bbox = useMemo(() => {
     if (!mainPolygon) return null;
     return turf.bbox(mainPolygon);
   }, [mainPolygon]);
 
   const stats = useMemo(() => {
-    if (!flightLines || !tieLines) return null;
-    const fLength = turf.length(flightLines, { units: 'kilometers' });
-    const tLength = turf.length(tieLines, { units: 'kilometers' });
+    if (!allFlightLines || !allTieLines) return null;
+    const fLength = turf.length(allFlightLines, { units: 'kilometers' });
+    const tLength = turf.length(allTieLines, { units: 'kilometers' });
     const area = mainPolygon ? turf.area(mainPolygon) / 1000000 : 0; // km2
     return {
       flightLength: fLength.toFixed(2),
@@ -885,7 +973,7 @@ export default function App() {
       totalLength: (fLength + tLength).toFixed(2),
       area: area.toFixed(3)
     };
-  }, [flightLines, tieLines, mainPolygon]);
+  }, [allFlightLines, allTieLines, mainPolygon]);
 
   // Calculate area of interest
   const areaStats = useMemo(() => {
@@ -900,7 +988,358 @@ export default function App() {
     };
   }, [mainPolygon]);
 
+  const dgpsCandidates = useMemo(() => {
+    if (!mainPolygon) return null;
+
+    // Deterministic pseudo index generator for offline candidate preview.
+    const pseudo = (lon: number, lat: number, seed: number) => {
+      const value = Math.sin((lon * 12.9898 + lat * 78.233 + seed) * 43758.5453) * 10000;
+      return value - Math.floor(value);
+    };
+
+    const aoiBbox = turf.bbox(mainPolygon);
+    const areaKm2 = turf.area(mainPolygon) / 1_000_000;
+    const spacingKm = Math.max(0.1, Math.min(0.5, Math.sqrt(Math.max(areaKm2, 0.1)) / 5));
+    const grid = turf.pointGrid(aoiBbox, spacingKm, { units: 'kilometers', mask: mainPolygon });
+
+    // Keep generation bounded for responsiveness on large AOIs.
+    const maxGridPoints = 2000;
+    const gridFeatures = grid.features.slice(0, maxGridPoints);
+
+    const generatedCandidates: Feature<Point>[] = gridFeatures
+      .map((feature, idx) => {
+        const [lon, lat] = feature.geometry.coordinates;
+
+        const ndvi = -0.15 + pseudo(lon, lat, 11 + idx * 0.01) * 0.9;
+        const ndbi = -0.25 + pseudo(lon, lat, 23 + idx * 0.01) * 0.95;
+        const elevation = 50 + pseudo(lon, lat, 37 + idx * 0.01) * 2800;
+        const slope = pseudo(lon, lat, 41 + idx * 0.01) * 12;
+
+        const passes =
+          ndvi <= dgpsThresholds.ndviMax &&
+          ndbi >= dgpsThresholds.ndbiMin &&
+          elevation >= dgpsThresholds.minElevation;
+
+        if (!passes) return null;
+
+        const ndviScore = Math.max(0, Math.min(1, (dgpsThresholds.ndviMax - ndvi + 1) / 2));
+        const ndbiScore = Math.max(0, Math.min(1, (ndbi - dgpsThresholds.ndbiMin + 1) / 2));
+        const elevScore = Math.max(0, Math.min(1, (elevation - dgpsThresholds.minElevation) / 1200));
+        const slopeScore = Math.max(0, Math.min(1, 1 - slope / 12));
+
+        const score = (ndviScore * 0.3 + ndbiScore * 0.3 + elevScore * 0.25 + slopeScore * 0.15) * 100;
+
+        return turf.point([lon, lat], {
+          ndvi: Number(ndvi.toFixed(3)),
+          ndbi: Number(ndbi.toFixed(3)),
+          elevationM: Number(elevation.toFixed(1)),
+          slopeDeg: Number(slope.toFixed(2)),
+          score: Number(score.toFixed(1)),
+          candidateId: `DGPS-${idx + 1}`
+        });
+      })
+      .filter((feature): feature is Feature<Point> => feature !== null)
+      .filter((feature) => !removedGeneratedCandidateIds.has(String(feature.properties?.candidateId ?? '')))
+      .sort((a, b) => (Number(b.properties?.score ?? 0) - Number(a.properties?.score ?? 0)))
+      .slice(0, dgpsMaxCandidates)
+      .map((feature) => ({
+        ...feature,
+        properties: {
+          ...feature.properties,
+          source: 'generated'
+        }
+      }));
+
+    const mergedCandidates = [...generatedCandidates, ...manualDgpsPoints]
+      .sort((a, b) => (Number(b.properties?.score ?? 0) - Number(a.properties?.score ?? 0)))
+      .map((feature, index) => ({
+        ...feature,
+        properties: {
+          ...feature.properties,
+          rank: index + 1
+        }
+      }));
+
+    return turf.featureCollection(mergedCandidates);
+  }, [mainPolygon, dgpsThresholds, dgpsMaxCandidates, manualDgpsPoints, removedGeneratedCandidateIds]);
+
+  const selectedDgpsCandidate = useMemo(() => {
+    if (!selectedDgpsCandidateId || !dgpsCandidates) return null;
+    return dgpsCandidates.features.find(
+      f => String(f.properties?.candidateId ?? '') === selectedDgpsCandidateId
+    ) ?? null;
+  }, [selectedDgpsCandidateId, dgpsCandidates]);
+
+  const dgpsValidationStats = useMemo(() => {
+    const records = Object.values(dgpsValidationRecords);
+    const accepted = records.filter(r => r.label === 'accepted').length;
+    const rejected = records.filter(r => r.label === 'rejected').length;
+    const total = records.length;
+    return {
+      accepted,
+      rejected,
+      total,
+      acceptanceRate: total > 0 ? accepted / total : 0
+    };
+  }, [dgpsValidationRecords]);
+
+  const estimateDgpsSuitabilityProbability = useCallback((score: number) => {
+    const records = Object.values(dgpsValidationRecords);
+    if (records.length === 0) {
+      return 0.5;
+    }
+
+    const localSamples = records.filter(r => Math.abs(r.score - score) <= 10);
+    const sampleSet = localSamples.length >= 5 ? localSamples : records;
+
+    const accepted = sampleSet.filter(r => r.label === 'accepted').length;
+    const total = sampleSet.length;
+
+    // Laplace smoothing avoids unstable 0/100% with small sample sizes.
+    return (accepted + 1) / (total + 2);
+  }, [dgpsValidationRecords]);
+
+  const normalizeAngle180 = (angleDeg: number) => {
+    let normalized = angleDeg % 180;
+    if (normalized < 0) normalized += 180;
+    return normalized;
+  };
+
+  const getReferenceLonLat = (lines: Feature<LineString>[]) => {
+    const allCoords = lines.flatMap(line => line.geometry.coordinates);
+    if (allCoords.length === 0) return { lon: 0, lat: 0 };
+
+    const lon = allCoords.reduce((sum, c) => sum + c[0], 0) / allCoords.length;
+    const lat = allCoords.reduce((sum, c) => sum + c[1], 0) / allCoords.length;
+    return { lon, lat };
+  };
+
+  const toLocalMeters = (coord: number[], ref: { lon: number; lat: number }) => {
+    const latRad = (ref.lat * Math.PI) / 180;
+    const metersPerDegLon = 111320 * Math.cos(latRad);
+    const metersPerDegLat = 110540;
+    const x = (coord[0] - ref.lon) * metersPerDegLon;
+    const y = (coord[1] - ref.lat) * metersPerDegLat;
+    return { x, y };
+  };
+
+  const getLineAzimuth = (feature: Feature<LineString>, ref: { lon: number; lat: number }) => {
+    const coords = feature.geometry.coordinates;
+    if (!coords || coords.length < 2) return 0;
+    const start = toLocalMeters(coords[0], ref);
+    const end = toLocalMeters(coords[coords.length - 1], ref);
+    const dx = end.x - start.x;
+    const dy = end.y - start.y;
+    const angle = Math.atan2(dy, dx) * (180 / Math.PI);
+    return normalizeAngle180(angle);
+  };
+
+  const isTieLineFeature = (feature: Feature<LineString>) => {
+    const rawType = String(feature.properties?.type ?? '').toLowerCase();
+    return rawType === 'tie' || rawType.includes('tie') || rawType.startsWith('tl');
+  };
+
+  const isFlightLineFeature = (feature: Feature<LineString>) => {
+    const rawType = String(feature.properties?.type ?? '').toLowerCase();
+    if (!rawType) return true;
+    if (isTieLineFeature(feature)) return false;
+    return rawType === 'flight' || rawType.includes('flight') || rawType.startsWith('fl');
+  };
+
+  const circularMean180 = (angles: number[]) => {
+    if (angles.length === 0) return 0;
+    // Double-angle trick for 180-degree periodicity.
+    const doubled = angles.map(a => (2 * a * Math.PI) / 180);
+    const sx = doubled.reduce((sum, a) => sum + Math.cos(a), 0);
+    const sy = doubled.reduce((sum, a) => sum + Math.sin(a), 0);
+    const mean = (Math.atan2(sy, sx) * 180) / Math.PI / 2;
+    return normalizeAngle180(mean);
+  };
+
+  const circularDistance180 = (a: number, b: number) => {
+    const d = Math.abs(normalizeAngle180(a) - normalizeAngle180(b));
+    return Math.min(d, 180 - d);
+  };
+
+  const estimateDominantAngle = (angles: number[]) => {
+    if (angles.length === 0) return 0;
+    const binSize = 5;
+    const bins = new Array(Math.ceil(180 / binSize)).fill(0) as number[];
+
+    angles.forEach(a => {
+      const idx = Math.floor(normalizeAngle180(a) / binSize) % bins.length;
+      bins[idx] += 1;
+    });
+
+    let bestIdx = 0;
+    for (let i = 1; i < bins.length; i++) {
+      if (bins[i] > bins[bestIdx]) bestIdx = i;
+    }
+
+    const center = bestIdx * binSize + binSize / 2;
+    const inBin = angles.filter(a => circularDistance180(a, center) <= binSize);
+    return circularMean180(inBin.length > 0 ? inBin : angles);
+  };
+
+  const estimateSpacingMeters = (
+    lines: Feature<LineString>[],
+    lineAngleDeg: number,
+    ref: { lon: number; lat: number }
+  ) => {
+    if (lines.length < 2) return null;
+
+    const normalRad = ((lineAngleDeg + 90) * Math.PI) / 180;
+    const nx = Math.cos(normalRad);
+    const ny = Math.sin(normalRad);
+
+    const projections = lines.map(line => {
+      const start = toLocalMeters(line.geometry.coordinates[0], ref);
+      const end = toLocalMeters(line.geometry.coordinates[line.geometry.coordinates.length - 1], ref);
+      const mx = (start.x + end.x) / 2;
+      const my = (start.y + end.y) / 2;
+      return mx * nx + my * ny;
+    }).sort((a, b) => a - b);
+
+    const distances: number[] = [];
+    for (let i = 1; i < projections.length; i++) {
+      const p1 = projections[i - 1];
+      const p2 = projections[i];
+      const meters = Math.abs(p2 - p1);
+      if (meters > 1) distances.push(meters);
+    }
+
+    if (distances.length === 0) return null;
+    distances.sort((a, b) => a - b);
+
+    // Robust median with mild outlier rejection.
+    const rawMedian = distances[Math.floor(distances.length / 2)];
+    const filtered = distances.filter(d => d <= rawMedian * 3);
+    const source = filtered.length > 0 ? filtered : distances;
+    return source[Math.floor(source.length / 2)];
+  };
+
+  const inferSettingsFromImportedLines = (lines: Feature<LineString>[]) => {
+    const ref = getReferenceLonLat(lines);
+    const flightTagged = lines.filter(isFlightLineFeature);
+    const tieTagged = lines.filter(isTieLineFeature);
+
+    const allAngles = lines.map(line => getLineAzimuth(line, ref));
+    const dominantAngle = estimateDominantAngle(allAngles);
+
+    const defaultFlightSet = lines.filter(
+      line => circularDistance180(getLineAzimuth(line, ref), dominantAngle) <= 20
+    );
+
+    const defaultTieSet = lines.filter(
+      line => circularDistance180(getLineAzimuth(line, ref), normalizeAngle180(dominantAngle + 90)) <= 20
+    );
+
+    const flightSet = flightTagged.length >= 2 ? flightTagged : defaultFlightSet;
+    const tieSet = tieTagged.length >= 2 ? tieTagged : defaultTieSet;
+
+    const inferredAngle = flightSet.length > 0
+      ? circularMean180(flightSet.map(line => getLineAzimuth(line, ref)))
+      : dominantAngle;
+
+    const inferredFlightSpacing = estimateSpacingMeters(
+      flightSet.length >= 2 ? flightSet : lines,
+      inferredAngle,
+      ref
+    );
+
+    const tieAngle = normalizeAngle180(inferredAngle + 90);
+    const inferredTieSpacing = tieSet.length >= 2
+      ? estimateSpacingMeters(tieSet, tieAngle, ref)
+      : null;
+
+    return {
+      angle: Math.round(inferredAngle),
+      flightLineSpacing: inferredFlightSpacing ? Math.max(5, Math.round(inferredFlightSpacing)) : null,
+      tieLineSpacing: inferredTieSpacing ? Math.max(5, Math.round(inferredTieSpacing)) : null
+    };
+  };
+
   // Handlers
+  // Parse CSV line plan files
+  const parseLinePlanCSV = (csvText: string): Feature<LineString>[] => {
+    const lines = csvText.split('\n').map(l => l.trim()).filter(l => l);
+    const features: Feature<LineString>[] = [];
+    
+    // Skip header rows and find data start
+    let dataStartIndex = 0;
+    for (let i = 0; i < lines.length; i++) {
+      // Look for lines that start with a number or quote followed by number (line IDs)
+      if (/^"?\d+/.test(lines[i]) || /^FL|^TL|^LINE/i.test(lines[i])) {
+        dataStartIndex = i;
+        break;
+      }
+    }
+    
+    for (let i = dataStartIndex; i < lines.length; i++) {
+      const line = lines[i];
+      // Parse CSV line (handle quoted fields)
+      const fields: string[] = [];
+      let inQuote = false;
+      let field = '';
+      
+      for (let j = 0; j < line.length; j++) {
+        const char = line[j];
+        if (char === '"') {
+          inQuote = !inQuote;
+        } else if (char === ',' && !inQuote) {
+          fields.push(field.trim());
+          field = '';
+        } else {
+          field += char;
+        }
+      }
+      fields.push(field.trim());
+      
+      // Try to extract coordinates
+      // Expected formats: LineID, Type, Length, StartLat/StartLng or StartEasting/StartNorthing, EndLat/EndLng or EndEasting/EndNorthing
+      if (fields.length >= 5) {
+        const lineId = fields[0].replace(/"/g, '');
+        const lineType = fields[1]?.replace(/"/g, '') || 'flight';
+        
+        // Try to parse coordinates (fields 3-6 are typically start/end coords)
+        const coord1 = parseFloat(fields[3]?.replace(/"/g, '') || '0');
+        const coord2 = parseFloat(fields[4]?.replace(/"/g, '') || '0');
+        const coord3 = parseFloat(fields[5]?.replace(/"/g, '') || '0');
+        const coord4 = parseFloat(fields[6]?.replace(/"/g, '') || '0');
+        
+        if (!isNaN(coord1) && !isNaN(coord2) && !isNaN(coord3) && !isNaN(coord4)) {
+          let startLng, startLat, endLng, endLat;
+          
+          // Determine if coords are lat/lng or UTM easting/northing
+          // Lat/lng: typically -180 to 180, -90 to 90
+          // UTM: much larger numbers (100000+)
+          if (Math.abs(coord1) < 360 && Math.abs(coord2) < 360) {
+            // Assume lat/lng format: lng, lat
+            startLng = coord1;
+            startLat = coord2;
+            endLng = coord3;
+            endLat = coord4;
+          } else {
+            // Skip UTM conversion for now - would need zone info
+            continue;
+          }
+          
+          const feature = turf.lineString(
+            [[startLng, startLat], [endLng, endLat]],
+            {
+              id: lineId,
+              type: lineType,
+              source: 'imported'
+            }
+          );
+          features.push(feature);
+        }
+      }
+    }
+    
+    return features;
+  };
+
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
     if (!files || files.length === 0) return;
@@ -909,6 +1348,7 @@ export default function App() {
 
     try {
       const newFiles: UploadedFile[] = [];
+      let importedLines: Feature<LineString>[] = [];
 
       for (let i = 0; i < files.length; i++) {
         const file = files[i];
@@ -920,7 +1360,16 @@ export default function App() {
 
           console.log(`Processing file: ${file.name} (${buffer.byteLength} bytes) extension: ${extension}`);
 
-          if (extension === 'kml') {
+          if (extension === 'csv') {
+            // Try to parse as line plan CSV
+            const text = new TextDecoder().decode(buffer);
+            const csvLines = parseLinePlanCSV(text);
+            if (csvLines.length > 0) {
+              importedLines = importedLines.concat(csvLines);
+              console.log(`Imported ${csvLines.length} line features from CSV`);
+              continue; // Skip normal processing for line plan CSVs
+            }
+          } else if (extension === 'kml') {
             const text = new TextDecoder().decode(buffer);
             const dom = new DOMParser().parseFromString(text, 'text/xml');
             data = kml(dom);
@@ -940,7 +1389,7 @@ export default function App() {
               data = await shp(buffer);
             } catch (err: any) {
               if (extension !== 'zip') {
-                throw new Error(`Unsupported file format: .${extension}. Please use .zip (Shapefile), .kml, .kmz, or .geojson`);
+                throw new Error(`Unsupported file format: .${extension}. Please use .zip (Shapefile), .kml, .kmz, .csv, or .geojson`);
               }
               throw err;
             }
@@ -954,12 +1403,14 @@ export default function App() {
           let fileGeoJson: FeatureCollection;
           
           if (Array.isArray(data)) {
-            // Find the first feature collection with polygons
-            const collectionWithPolygons = data.find(item => 
-              item.type === 'FeatureCollection' && 
-              item.features.some((f: any) => f.geometry.type === 'Polygon' || f.geometry.type === 'MultiPolygon')
-            );
-            fileGeoJson = (collectionWithPolygons || data[0]) as FeatureCollection;
+            // Combine all collections
+            const allFeatures: Feature[] = [];
+            data.forEach(item => {
+              if (item.type === 'FeatureCollection') {
+                allFeatures.push(...item.features);
+              }
+            });
+            fileGeoJson = turf.featureCollection(allFeatures) as FeatureCollection;
           } else if (data.type === 'FeatureCollection') {
             fileGeoJson = data as FeatureCollection;
           } else if (data.type === 'Feature') {
@@ -968,12 +1419,35 @@ export default function App() {
             fileGeoJson = data as FeatureCollection;
           }
 
-          // Add to the list of uploaded files
-          newFiles.push({
-            id: `${Date.now()}-${i}`,
-            name: file.name,
-            geoJson: fileGeoJson
-          });
+          // Extract LineStrings as imported line plans
+          const lineFeatures = fileGeoJson.features.filter(
+            f => f.geometry.type === 'LineString'
+          ) as Feature<LineString>[];
+          
+          if (lineFeatures.length > 0) {
+            // Mark as imported and add unique IDs
+            lineFeatures.forEach((f, idx) => {
+              if (!f.properties) f.properties = {};
+              f.properties.source = 'imported';
+              if (!f.id) f.id = `imported-line-${Date.now()}-${idx}`;
+            });
+            importedLines = importedLines.concat(lineFeatures);
+            console.log(`Imported ${lineFeatures.length} line features from ${file.name}`);
+          }
+
+          // Extract polygons as boundaries
+          const polygonFeatures = fileGeoJson.features.filter(
+            f => f.geometry.type === 'Polygon' || f.geometry.type === 'MultiPolygon'
+          );
+          
+          if (polygonFeatures.length > 0) {
+            const boundaryGeoJson = turf.featureCollection(polygonFeatures) as FeatureCollection;
+            newFiles.push({
+              id: `${Date.now()}-${i}`,
+              name: file.name,
+              geoJson: boundaryGeoJson
+            });
+          }
 
         } catch (err: any) {
           console.error(`Error processing ${file.name}:`, err);
@@ -981,12 +1455,30 @@ export default function App() {
         }
       }
 
-      // Add all successfully processed files to state
+      // Load imported lines
+      if (importedLines.length > 0) {
+        const inferred = inferSettingsFromImportedLines(importedLines);
+        setImportedLineFeatures(importedLines);
+        setImportedLinesFileName(files[0].name);
+        setSettings(prev => ({
+          ...prev,
+          angle: inferred.angle,
+          flightLineSpacing: inferred.flightLineSpacing ?? prev.flightLineSpacing,
+          tieLineSpacing: inferred.tieLineSpacing ?? prev.tieLineSpacing
+        }));
+
+        alert(
+          `Successfully imported ${importedLines.length} line feature(s). ` +
+          `Detected angle: ${inferred.angle}deg, ` +
+          `flight spacing: ${inferred.flightLineSpacing ?? 'n/a'}m, ` +
+          `tie spacing: ${inferred.tieLineSpacing ?? 'n/a'}m.`
+        );
+      }
+
+      // Load boundaries
       if (newFiles.length > 0) {
-        if (newFiles.length > 0) {
-          setGeoJson(newFiles[0].geoJson);
-          setFileName(newFiles[0].name);
-        }
+        setGeoJson(newFiles[0].geoJson);
+        setFileName(newFiles[0].name);
       }
 
     } catch (err: any) {
@@ -1008,6 +1500,8 @@ export default function App() {
     setDeletedLineIds(new Set());
     setModifiedLines({});
     setSelectedLineId(null);
+    setImportedLineFeatures([]);
+    setImportedLinesFileName('');
   };
 
   const latLngToUTM = (lat: number, lng: number) => {
@@ -1035,7 +1529,7 @@ export default function App() {
   };
 
   const generateSummaryCSV = () => {
-    if (!flightLines || !tieLines || !stats) return '';
+    if (!allFlightLines || !allTieLines || !stats) return '';
     const baseName = fileName ? fileName.split('.')[0] : 'drone-plan';
     const timestamp = new Date().toISOString().split('T')[0];
     
@@ -1043,6 +1537,9 @@ export default function App() {
     csv += '"LINE PLAN SUMMARY"\n';
     csv += '"Generated Date","' + timestamp + '"\n';
     csv += '"Project Name","' + baseName + '"\n';
+        if (importedLinesFileName) {
+          csv += '"Imported From","' + importedLinesFileName + '"\n';
+        }
     csv += '\n';
     
     csv += '"MISSION SETTINGS"\n';
@@ -1056,9 +1553,9 @@ export default function App() {
     csv += '\n';
     
     csv += '"MISSION STATISTICS"\n';
-    csv += '"Flight Lines","' + flightLines.features.length + '"\n';
-    csv += '"Tie Lines","' + tieLines.features.length + '"\n';
-    csv += '"Total Lines","' + (flightLines.features.length + tieLines.features.length) + '"\n';
+    csv += '"Flight Lines","' + allFlightLines.features.length + '"\n';
+    csv += '"Tie Lines","' + allTieLines.features.length + '"\n';
+    csv += '"Total Lines","' + (allFlightLines.features.length + allTieLines.features.length) + '"\n';
     csv += '"Flight Line Distance (km)","' + stats.flightLength + '"\n';
     csv += '"Tie Line Distance (km)","' + stats.tieLength + '"\n';
     csv += '"Total Path Length (km)","' + stats.totalLength + '"\n';
@@ -1072,45 +1569,78 @@ export default function App() {
   };
 
   const generateLineDetailsCSV = () => {
-    if (!flightLines || !tieLines) return '';
+    if (!allFlightLines || !allTieLines) return '';
     
     let csv = '';
-    csv += '"Line ID","Type","Length (km)","START","","END",""\n';
-    csv += '"","","","Easting","Northing","Easting","Northing"\n';
+    csv += '"Line ID","Type","Length (km)","Source","START","","END",""\n';
+    csv += '"","","","","Longitude","Latitude","Longitude","Latitude"\n';
     
-    flightLines.features.forEach((feature, idx) => {
+    allFlightLines.features.forEach((feature, idx) => {
       const coords = feature.geometry.coordinates;
       const lineLength = turf.length(feature, { units: 'kilometers' });
-      const startLat = coords[0][1];
       const startLng = coords[0][0];
-      const endLat = coords[coords.length - 1][1];
+      const startLat = coords[0][1];
       const endLng = coords[coords.length - 1][0];
+      const endLat = coords[coords.length - 1][1];
+      const source = feature.properties?.source || 'generated';
       
-      const startUTM = latLngToUTM(startLat, startLng);
-      const endUTM = latLngToUTM(endLat, endLng);
-      
-      csv += `"FL-${idx + 1}","Flight Line","${lineLength.toFixed(4)}","${startUTM.easting}","${startUTM.northing}","${endUTM.easting}","${endUTM.northing}"\n`;
+      csv += `"FL-${idx + 1}","Flight Line","${lineLength.toFixed(4)}","${source}","${startLng.toFixed(6)}","${startLat.toFixed(6)}","${endLng.toFixed(6)}","${endLat.toFixed(6)}"\n`;
     });
     
-    tieLines.features.forEach((feature, idx) => {
+    allTieLines.features.forEach((feature, idx) => {
       const coords = feature.geometry.coordinates;
       const lineLength = turf.length(feature, { units: 'kilometers' });
-      const startLat = coords[0][1];
       const startLng = coords[0][0];
-      const endLat = coords[coords.length - 1][1];
+      const startLat = coords[0][1];
       const endLng = coords[coords.length - 1][0];
+      const endLat = coords[coords.length - 1][1];
+      const source = feature.properties?.source || 'generated';
       
-      const startUTM = latLngToUTM(startLat, startLng);
-      const endUTM = latLngToUTM(endLat, endLng);
-      
-      csv += `"TL-${idx + 1}","Tie Line","${lineLength.toFixed(4)}","${startUTM.easting}","${startUTM.northing}","${endUTM.easting}","${endUTM.northing}"\n`;
+      csv += `"TL-${idx + 1}","Tie Line","${lineLength.toFixed(4)}","${source}","${startLng.toFixed(6)}","${startLat.toFixed(6)}","${endLng.toFixed(6)}","${endLat.toFixed(6)}"\n`;
     });
     
     return csv;
   };
 
+  const exportDgpsShapefile = async () => {
+    if (!dgpsCandidates || dgpsCandidates.features.length === 0) {
+      alert('No DGPS candidate points available to export.');
+      return;
+    }
+
+    const baseName = fileName ? fileName.split('.')[0] : 'drone-plan';
+    const dgpsCollection = turf.featureCollection(
+      dgpsCandidates.features.map((feature, index) => ({
+        type: 'Feature' as const,
+        geometry: feature.geometry,
+        properties: {
+          id: String(feature.properties?.candidateId ?? `DGPS-${index + 1}`),
+          rank: Number(feature.properties?.rank ?? index + 1),
+          score: Number(feature.properties?.score ?? 0),
+          ndvi: Number(feature.properties?.ndvi ?? 0),
+          ndbi: Number(feature.properties?.ndbi ?? 0),
+          elev_m: Number(feature.properties?.elevationM ?? 0),
+          slope_d: Number(feature.properties?.slopeDeg ?? 0),
+          source: String(feature.properties?.source ?? 'generated'),
+          valid: String(dgpsValidationRecords[String(feature.properties?.candidateId ?? '')]?.label ?? 'unlabeled')
+        }
+      }))
+    );
+
+    const shpZip = shpwrite.zip(dgpsCollection, {
+      folder: `${baseName}-dgps-candidates`,
+      filename: `${baseName}-dgps-candidates`
+    });
+
+    const shpBlob = shpZip instanceof Blob
+      ? shpZip
+      : new Blob([shpZip as ArrayBuffer | Uint8Array], { type: 'application/zip' });
+
+    downloadBlob(shpBlob, `${baseName}-dgps-candidates.zip`);
+  };
+
   const handleExport = async () => {
-    if (!flightLines || !tieLines) return;
+    if (!allFlightLines || !allTieLines) return;
     const baseName = fileName ? fileName.split('.')[0] : 'drone-plan';
     const sanitizeForFileName = (value: string) => value
       .trim()
@@ -1132,6 +1662,11 @@ export default function App() {
       return `${preflightPrefix}-${sequence}`;
     };
     
+    if (exportFormat === 'dgps-shp') {
+      await exportDgpsShapefile();
+      return;
+    }
+
     if (exportFormat === 'csv') {
       // Generate both CSV files and zip them together
       const summaryCSV = generateSummaryCSV();
@@ -1148,8 +1683,8 @@ export default function App() {
       const lineExtension = exportFormat === 'preflight-kml' ? 'kml' : 'kmz';
       let lineSequenceIndex = 0;
 
-      for (let i = 0; i < flightLines.features.length; i++) {
-        const feature = flightLines.features[i];
+      for (let i = 0; i < allFlightLines.features.length; i++) {
+        const feature = allFlightLines.features[i];
         const lineFeature = {
           ...feature,
           properties: {
@@ -1177,8 +1712,8 @@ export default function App() {
         }
       }
 
-      for (let i = 0; i < tieLines.features.length; i++) {
-        const feature = tieLines.features[i];
+      for (let i = 0; i < allTieLines.features.length; i++) {
+        const feature = allTieLines.features[i];
         const lineFeature = {
           ...feature,
           properties: {
@@ -1239,9 +1774,9 @@ export default function App() {
   };
 
   const getCombinedGeoJSON = () => {
-    if (!flightLines || !tieLines) return turf.featureCollection([]);
+    if (!allFlightLines || !allTieLines) return turf.featureCollection([]);
     const features = [
-      ...flightLines.features.map((f, idx) => ({ 
+      ...allFlightLines.features.map((f, idx) => ({ 
         ...f, 
         properties: { 
           type: 'Flight Line',
@@ -1250,10 +1785,11 @@ export default function App() {
           name: `Flight Line ${idx + 1}`,
           stroke: settings.flightLineColor,
           'stroke-width': 3,
-          'stroke-opacity': 1
+          'stroke-opacity': 1,
+          source: f.properties?.source || 'generated'
         } 
       })),
-      ...tieLines.features.map((f, idx) => ({ 
+      ...allTieLines.features.map((f, idx) => ({ 
         ...f, 
         properties: { 
           type: 'Tie Line',
@@ -1263,7 +1799,8 @@ export default function App() {
           stroke: settings.tieLineColor,
           'stroke-width': 1.5,
           'stroke-opacity': 0.8,
-          'stroke-dasharray': '4, 4'
+          'stroke-dasharray': '4, 4',
+          source: f.properties?.source || 'generated'
         } 
       }))
     ];
@@ -1298,7 +1835,7 @@ export default function App() {
     };
 
     // Fixed colors for KML export (Google Earth display)
-    const flightLineColor = '#90EE90'; // Light green
+    const flightLineColor = '#40E0D0'; // Turquoise blue
     const tieLineColor = '#FFFF00';    // Yellow
     const boundaryColor = '#FF0000';   // Red
 
@@ -1468,6 +2005,35 @@ export default function App() {
   };
 
   const handleMapClick = (e: L.LeafletMouseEvent) => {
+    if (dgpsEditMode === 'add') {
+      if (!mainPolygon) return;
+
+      const clickPoint = turf.point([e.latlng.lng, e.latlng.lat]);
+      if (!turf.booleanPointInPolygon(clickPoint, mainPolygon)) {
+        return;
+      }
+
+      const manualCandidateId = `DGPS-M-${Date.now()}`;
+      const manualPoint = turf.point([e.latlng.lng, e.latlng.lat], {
+        candidateId: manualCandidateId,
+        source: 'manual',
+        score: 100,
+        ndvi: 0,
+        ndbi: 0,
+        elevationM: 0,
+        slopeDeg: 0,
+        rank: (dgpsCandidates?.features.length ?? 0) + 1
+      });
+
+      setManualDgpsPoints(prev => [...prev, manualPoint]);
+      setDgpsEditHistory(prev => [...prev, {
+        type: 'add-manual',
+        candidateId: manualCandidateId,
+        candidate: manualPoint
+      }]);
+      return;
+    }
+
     if (measurementMode === 'distance' || measurementMode === 'area') {
       setMeasurementPoints(prev => [...prev, [e.latlng.lng, e.latlng.lat]]);
     } else if (isAddingNote) {
@@ -1481,6 +2047,55 @@ export default function App() {
       // Ctrl+Click to set home point
       setHomePoint({ lat: e.latlng.lat, lng: e.latlng.lng });
     }
+  };
+
+  const undoLastDgpsEdit = () => {
+    setDgpsEditHistory(prev => {
+      if (prev.length === 0) return prev;
+
+      const next = [...prev];
+      const lastAction = next.pop();
+      if (!lastAction) return prev;
+
+      if (lastAction.type === 'add-manual') {
+        setManualDgpsPoints(points => points.filter(
+          p => String(p.properties?.candidateId) !== lastAction.candidateId
+        ));
+      } else if (lastAction.type === 'remove-manual') {
+        setManualDgpsPoints(points => [...points, lastAction.candidate]);
+      } else if (lastAction.type === 'remove-generated') {
+        setRemovedGeneratedCandidateIds(ids => {
+          const cloned = new Set(ids);
+          cloned.delete(lastAction.candidateId);
+          return cloned;
+        });
+      }
+
+      return next;
+    });
+  };
+
+  const labelSelectedDgpsCandidate = (label: 'accepted' | 'rejected') => {
+    if (!selectedDgpsCandidate) return;
+
+    const candidateId = String(selectedDgpsCandidate.properties?.candidateId ?? '');
+    const score = Number(selectedDgpsCandidate.properties?.score ?? 0);
+    const source = String(selectedDgpsCandidate.properties?.source ?? 'generated');
+
+    setDgpsValidationRecords(prev => ({
+      ...prev,
+      [candidateId]: {
+        candidateId,
+        score,
+        label,
+        source,
+        timestamp: Date.now()
+      }
+    }));
+  };
+
+  const clearDgpsValidationData = () => {
+    setDgpsValidationRecords({});
   };
 
   const clearMeasurement = () => {
@@ -1612,6 +2227,44 @@ export default function App() {
             </motion.div>
           </div>
         )}
+
+                  {/* Imported Line Plans Indicator */}
+                  {importedLineFeatures.length > 0 && (
+                    <div className={cn(
+                      "rounded-lg p-3 border mt-3",
+                      darkMode ? "bg-emerald-900/20 border-emerald-800/50" : "bg-emerald-50 border-emerald-100"
+                    )}>
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-2">
+                          <Activity className="w-4 h-4 text-emerald-600 shrink-0" />
+                          <div>
+                            <p className={cn(
+                              "text-xs font-medium",
+                              darkMode ? "text-emerald-400" : "text-emerald-900"
+                            )}>Imported Line Plan</p>
+                            <p className={cn(
+                              "text-[10px] font-mono",
+                              darkMode ? "text-emerald-400" : "text-emerald-600"
+                            )}>{importedLineFeatures.length} line{importedLineFeatures.length !== 1 ? 's' : ''} from {importedLinesFileName}</p>
+                          </div>
+                        </div>
+                        <button
+                          onClick={() => {
+                            setImportedLineFeatures([]);
+                            setImportedLinesFileName('');
+                          }}
+                          className={cn(
+                            "p-1.5 rounded transition-colors",
+                            darkMode 
+                              ? "hover:bg-red-900/20 text-slate-400 hover:text-red-400" 
+                              : "hover:bg-red-50 text-slate-300 hover:text-red-500"
+                          )}
+                        >
+                          <X className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    </div>
+                  )}
       </AnimatePresence>
 
       {/* Edit Note Modal */}
@@ -1801,7 +2454,7 @@ export default function App() {
               <input 
                 type="file" 
                 className="hidden" 
-                accept=".zip,.kml,.kmz,.json,.geojson" 
+                accept=".zip,.kml,.kmz,.json,.geojson,.csv" 
                 onChange={handleFileUpload} 
                 multiple 
               />
@@ -2091,6 +2744,16 @@ export default function App() {
                 <span className="text-xs text-slate-600 flex-1">Show Line Labels</span>
                 <MapPin className="w-3 h-3 text-slate-400" />
               </label>
+              <label className="flex items-center gap-3 cursor-pointer p-2 rounded-lg hover:bg-slate-50 transition-colors">
+                <input
+                  type="checkbox"
+                  checked={showDgpsCandidates}
+                  onChange={(e) => setShowDgpsCandidates(e.target.checked)}
+                  className="w-4 h-4 rounded border-slate-300 cursor-pointer"
+                />
+                <span className="text-xs text-slate-600 flex-1">Show DGPS Candidates</span>
+                <div className="w-3 h-3 rounded-full bg-emerald-500" />
+              </label>
               {Object.keys(lineLabels).length > 0 && (
                 <div className="px-2">
                   <button
@@ -2101,6 +2764,285 @@ export default function App() {
                   </button>
                 </div>
               )}
+            </div>
+          </section>
+
+          {/* DGPS Threshold Controls */}
+          <section className={cn("space-y-3 pt-4 border-t border-slate-100 transition-opacity", !geoJson && "opacity-30 pointer-events-none")}>
+            <label className="block text-[10px] uppercase tracking-widest text-slate-400 font-mono">DGPS Site Filters</label>
+
+            <div className={cn(
+              "rounded-lg p-3 border space-y-3",
+              darkMode ? "bg-emerald-900/20 border-emerald-800/50" : "bg-emerald-50/70 border-emerald-100"
+            )}>
+              <p className={cn(
+                "text-[10px] leading-relaxed",
+                darkMode ? "text-emerald-300/80" : "text-emerald-800/80"
+              )}>
+                Manually tune thresholds for bare-ground DGPS candidate filtering.
+              </p>
+
+              <div>
+                <div className="flex items-center justify-between mb-1.5">
+                  <label className={cn("text-[11px]", darkMode ? "text-slate-200" : "text-slate-700")}>Max Candidates</label>
+                  <input
+                    type="number"
+                    min={5}
+                    max={500}
+                    step={1}
+                    value={dgpsMaxCandidates}
+                    onChange={(e) => setDgpsMaxCandidates(Math.max(5, Math.min(500, Number(e.target.value) || 5)))}
+                    className={cn(
+                      "w-20 border rounded px-1.5 py-0.5 text-xs font-mono text-right focus:border-emerald-500/50 outline-none",
+                      darkMode ? "bg-slate-700 border-slate-600 text-emerald-300" : "bg-white border-slate-200 text-emerald-700"
+                    )}
+                  />
+                </div>
+                <input
+                  type="range"
+                  min="5"
+                  max="500"
+                  step="1"
+                  value={dgpsMaxCandidates}
+                  onChange={(e) => setDgpsMaxCandidates(Number(e.target.value))}
+                  className={cn(
+                    "w-full h-1.5 rounded-lg appearance-none cursor-pointer accent-emerald-600",
+                    darkMode ? "bg-slate-700" : "bg-slate-100"
+                  )}
+                />
+              </div>
+
+              <div>
+                <div className="flex items-center justify-between mb-1.5">
+                  <label className={cn("text-[11px]", darkMode ? "text-slate-200" : "text-slate-700")}>NDVI Max</label>
+                  <input
+                    type="number"
+                    min={-1}
+                    max={1}
+                    step={0.01}
+                    value={dgpsThresholds.ndviMax}
+                    onChange={(e) => setDgpsThresholds(prev => ({ ...prev, ndviMax: Number(e.target.value) }))}
+                    className={cn(
+                      "w-20 border rounded px-1.5 py-0.5 text-xs font-mono text-right focus:border-emerald-500/50 outline-none",
+                      darkMode ? "bg-slate-700 border-slate-600 text-emerald-300" : "bg-white border-slate-200 text-emerald-700"
+                    )}
+                  />
+                </div>
+                <input
+                  type="range"
+                  min="-1"
+                  max="1"
+                  step="0.01"
+                  value={dgpsThresholds.ndviMax}
+                  onChange={(e) => setDgpsThresholds(prev => ({ ...prev, ndviMax: Number(e.target.value) }))}
+                  className={cn(
+                    "w-full h-1.5 rounded-lg appearance-none cursor-pointer accent-emerald-600",
+                    darkMode ? "bg-slate-700" : "bg-slate-100"
+                  )}
+                />
+              </div>
+
+              <div>
+                <div className="flex items-center justify-between mb-1.5">
+                  <label className={cn("text-[11px]", darkMode ? "text-slate-200" : "text-slate-700")}>NDBI Min</label>
+                  <input
+                    type="number"
+                    min={-1}
+                    max={1}
+                    step={0.01}
+                    value={dgpsThresholds.ndbiMin}
+                    onChange={(e) => setDgpsThresholds(prev => ({ ...prev, ndbiMin: Number(e.target.value) }))}
+                    className={cn(
+                      "w-20 border rounded px-1.5 py-0.5 text-xs font-mono text-right focus:border-emerald-500/50 outline-none",
+                      darkMode ? "bg-slate-700 border-slate-600 text-emerald-300" : "bg-white border-slate-200 text-emerald-700"
+                    )}
+                  />
+                </div>
+                <input
+                  type="range"
+                  min="-1"
+                  max="1"
+                  step="0.01"
+                  value={dgpsThresholds.ndbiMin}
+                  onChange={(e) => setDgpsThresholds(prev => ({ ...prev, ndbiMin: Number(e.target.value) }))}
+                  className={cn(
+                    "w-full h-1.5 rounded-lg appearance-none cursor-pointer accent-emerald-600",
+                    darkMode ? "bg-slate-700" : "bg-slate-100"
+                  )}
+                />
+              </div>
+
+              <div>
+                <div className="flex items-center justify-between mb-1.5">
+                  <label className={cn("text-[11px]", darkMode ? "text-slate-200" : "text-slate-700")}>Elevation Min (m)</label>
+                  <input
+                    type="number"
+                    min={0}
+                    max={9000}
+                    step={10}
+                    value={dgpsThresholds.minElevation}
+                    onChange={(e) => setDgpsThresholds(prev => ({ ...prev, minElevation: Number(e.target.value) }))}
+                    className={cn(
+                      "w-20 border rounded px-1.5 py-0.5 text-xs font-mono text-right focus:border-emerald-500/50 outline-none",
+                      darkMode ? "bg-slate-700 border-slate-600 text-emerald-300" : "bg-white border-slate-200 text-emerald-700"
+                    )}
+                  />
+                </div>
+                <input
+                  type="range"
+                  min="0"
+                  max="9000"
+                  step="10"
+                  value={dgpsThresholds.minElevation}
+                  onChange={(e) => setDgpsThresholds(prev => ({ ...prev, minElevation: Number(e.target.value) }))}
+                  className={cn(
+                    "w-full h-1.5 rounded-lg appearance-none cursor-pointer accent-emerald-600",
+                    darkMode ? "bg-slate-700" : "bg-slate-100"
+                  )}
+                />
+              </div>
+
+              <div className={cn(
+                "text-[10px] rounded-md px-2 py-1.5 border",
+                darkMode ? "bg-slate-800/70 text-slate-200 border-slate-700" : "bg-white/80 text-slate-700 border-slate-200"
+              )}>
+                Candidate points: <span className="font-bold">{dgpsCandidates?.features.length ?? 0}</span>
+              </div>
+
+              <div className={cn(
+                "text-[10px] rounded-md px-2 py-1.5 border space-y-1",
+                darkMode ? "bg-slate-800/70 text-slate-200 border-slate-700" : "bg-white/80 text-slate-700 border-slate-200"
+              )}>
+                <div className="font-semibold">Field Validation Model</div>
+                <div className="font-mono">Labeled: {dgpsValidationStats.total} | Accept: {dgpsValidationStats.accepted} | Reject: {dgpsValidationStats.rejected}</div>
+                <div className="font-mono">Global acceptance: {(dgpsValidationStats.acceptanceRate * 100).toFixed(1)}%</div>
+                {selectedDgpsCandidate && (
+                  <>
+                    <div className="font-mono">
+                      Selected: {String(selectedDgpsCandidate.properties?.candidateId ?? 'DGPS')} (score {Number(selectedDgpsCandidate.properties?.score ?? 0).toFixed(1)})
+                    </div>
+                    <div className="font-mono">
+                      Estimated suitability: {(estimateDgpsSuitabilityProbability(Number(selectedDgpsCandidate.properties?.score ?? 0)) * 100).toFixed(1)}%
+                    </div>
+                    <div className="grid grid-cols-2 gap-2 pt-1">
+                      <button
+                        onClick={() => labelSelectedDgpsCandidate('accepted')}
+                        className="px-2 py-1 rounded text-[10px] font-bold uppercase tracking-wider border bg-emerald-600 border-emerald-600 text-white hover:bg-emerald-500"
+                      >
+                        Mark Suitable
+                      </button>
+                      <button
+                        onClick={() => labelSelectedDgpsCandidate('rejected')}
+                        className="px-2 py-1 rounded text-[10px] font-bold uppercase tracking-wider border bg-red-600 border-red-600 text-white hover:bg-red-500"
+                      >
+                        Mark Unsuitable
+                      </button>
+                    </div>
+                  </>
+                )}
+                <button
+                  onClick={clearDgpsValidationData}
+                  disabled={dgpsValidationStats.total === 0}
+                  className={cn(
+                    "w-full px-2 py-1 rounded text-[10px] font-bold uppercase tracking-wider border transition-all",
+                    dgpsValidationStats.total === 0
+                      ? "bg-slate-200 border-slate-200 text-slate-400 cursor-not-allowed"
+                      : darkMode
+                        ? "bg-slate-700 border-slate-600 text-slate-200 hover:bg-slate-600"
+                        : "bg-white border-slate-200 text-slate-700 hover:bg-slate-50"
+                  )}
+                >
+                  Reset Validation Data
+                </button>
+              </div>
+
+              <div className="space-y-2">
+                <p className={cn("text-[10px]", darkMode ? "text-slate-300" : "text-slate-600")}>
+                  Manual edit mode:
+                </p>
+                <div className="grid grid-cols-3 gap-2">
+                  <button
+                    onClick={() => setDgpsEditMode('off')}
+                    className={cn(
+                      "px-2 py-1.5 rounded text-[10px] font-bold uppercase tracking-wider border transition-all",
+                      dgpsEditMode === 'off'
+                        ? "bg-emerald-600 border-emerald-600 text-white"
+                        : darkMode
+                          ? "bg-slate-700 border-slate-600 text-slate-300"
+                          : "bg-white border-slate-200 text-slate-600"
+                    )}
+                  >
+                    Off
+                  </button>
+                  <button
+                    onClick={() => setDgpsEditMode('add')}
+                    className={cn(
+                      "px-2 py-1.5 rounded text-[10px] font-bold uppercase tracking-wider border transition-all",
+                      dgpsEditMode === 'add'
+                        ? "bg-blue-600 border-blue-600 text-white"
+                        : darkMode
+                          ? "bg-slate-700 border-slate-600 text-slate-300"
+                          : "bg-white border-slate-200 text-slate-600"
+                    )}
+                  >
+                    Add
+                  </button>
+                  <button
+                    onClick={() => setDgpsEditMode('remove')}
+                    className={cn(
+                      "px-2 py-1.5 rounded text-[10px] font-bold uppercase tracking-wider border transition-all",
+                      dgpsEditMode === 'remove'
+                        ? "bg-red-600 border-red-600 text-white"
+                        : darkMode
+                          ? "bg-slate-700 border-slate-600 text-slate-300"
+                          : "bg-white border-slate-200 text-slate-600"
+                    )}
+                  >
+                    Remove
+                  </button>
+                </div>
+                <p className={cn("text-[9px] font-mono", darkMode ? "text-slate-400" : "text-slate-500")}>
+                  Manual points: {manualDgpsPoints.length} | Hidden generated: {removedGeneratedCandidateIds.size}
+                </p>
+                <button
+                  onClick={undoLastDgpsEdit}
+                  disabled={dgpsEditHistory.length === 0}
+                  className={cn(
+                    "w-full px-2 py-1.5 rounded text-[10px] font-bold uppercase tracking-wider border transition-all",
+                    dgpsEditHistory.length === 0
+                      ? "bg-slate-200 border-slate-200 text-slate-400 cursor-not-allowed"
+                      : darkMode
+                        ? "bg-slate-700 border-slate-600 text-slate-200 hover:bg-slate-600"
+                        : "bg-white border-slate-200 text-slate-700 hover:bg-slate-50"
+                  )}
+                >
+                  Undo Last DGPS Edit
+                </button>
+                <button
+                  onClick={() => {
+                    setManualDgpsPoints([]);
+                    setRemovedGeneratedCandidateIds(new Set());
+                    setDgpsEditHistory([]);
+                    setDgpsEditMode('off');
+                  }}
+                  className={cn(
+                    "w-full px-2 py-1.5 rounded text-[10px] font-bold uppercase tracking-wider border transition-all",
+                    darkMode
+                      ? "bg-slate-700 border-slate-600 text-slate-200 hover:bg-slate-600"
+                      : "bg-white border-slate-200 text-slate-700 hover:bg-slate-50"
+                  )}
+                >
+                  Reset DGPS Edits
+                </button>
+                <button
+                  onClick={exportDgpsShapefile}
+                  disabled={!geoJson || !dgpsCandidates || dgpsCandidates.features.length === 0}
+                  className="w-full bg-emerald-600 hover:bg-emerald-500 disabled:bg-slate-200 disabled:text-slate-400 text-white font-bold py-2 rounded-lg flex items-center justify-center gap-2 transition-all"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  Export DGPS Points
+                </button>
+              </div>
             </div>
           </section>
 
@@ -2425,6 +3367,7 @@ export default function App() {
                 { value: 'geojson', label: 'geojson' },
                 { value: 'kml', label: 'kml' },
                 { value: 'kmz', label: 'kmz' },
+                { value: 'dgps-shp', label: 'dgps-shp' },
                 { value: 'preflight-kml', label: 'pre-kml' },
                 { value: 'preflight-kmz', label: 'pre-kmz' }
               ] as const).map(({ value, label }) => (
@@ -2476,6 +3419,8 @@ export default function App() {
           <p className="text-[9px] text-center text-slate-400 mt-4 uppercase tracking-tighter">
             Exported as {exportFormat === 'csv'
               ? 'ZIP (2 CSV files - Summary & Line Details)'
+              : exportFormat === 'dgps-shp'
+                ? 'ZIP (DGPS point shapefile)'
               : exportFormat === 'preflight-kml'
                 ? 'ZIP (Individual KML per line, sequential names)'
                 : exportFormat === 'preflight-kmz'
@@ -2532,16 +3477,18 @@ export default function App() {
             />
           )}
 
-          {flightLines && showFlightLines && (
+          {allFlightLines && showFlightLines && (
             <GeoJSON 
-              key={`flight-${settings.flightLineSpacing}-${settings.angle}-${settings.flightLineColor}-${manualEditCounter}-${Object.keys(lineProgress).length}`}
-              data={flightLines} 
+              key={`flight-${settings.flightLineSpacing}-${settings.angle}-${settings.flightLineColor}-${manualEditCounter}-${Object.keys(lineProgress).length}-${importedLineFeatures.length}`}
+              data={allFlightLines} 
               style={(feature) => {
                 const progressColor = feature?.id ? getProgressColor(feature.id as string) : undefined;
+                const isImported = feature?.properties?.source === 'imported';
                 return {
                   color: selectedLineId === feature?.id ? '#ffffff' : progressColor || settings.flightLineColor,
-                  weight: selectedLineId === feature?.id ? 4 : 2,
-                  opacity: 0.8,
+                  weight: selectedLineId === feature?.id ? 4 : isImported ? 3 : 2,
+                  opacity: isImported ? 0.9 : 0.8,
+                  dashArray: isImported ? '8, 4' : undefined,
                   cursor: isEditMode ? 'pointer' : 'default'
                 };
               }}
@@ -2557,17 +3504,18 @@ export default function App() {
             />
           )}
 
-          {tieLines && showTieLines && (
+          {allTieLines && showTieLines && (
             <GeoJSON 
-              key={`tie-${settings.tieLineSpacing}-${settings.angle}-${settings.tieLineColor}-${manualEditCounter}-${Object.keys(lineProgress).length}`}
-              data={tieLines} 
+              key={`tie-${settings.tieLineSpacing}-${settings.angle}-${settings.tieLineColor}-${manualEditCounter}-${Object.keys(lineProgress).length}-${importedLineFeatures.length}`}
+              data={allTieLines} 
               style={(feature) => {
                 const progressColor = feature?.id ? getProgressColor(feature.id as string) : undefined;
+                const isImported = feature?.properties?.source === 'imported';
                 return {
                   color: selectedLineId === feature?.id ? '#ffffff' : progressColor || settings.tieLineColor,
-                  weight: selectedLineId === feature?.id ? 3 : 1.5,
-                  opacity: 0.6,
-                  dashArray: '4, 4',
+                  weight: selectedLineId === feature?.id ? 3 : isImported ? 2 : 1.5,
+                  opacity: isImported ? 0.7 : 0.6,
+                  dashArray: isImported ? '8, 4' : '4, 4',
                   cursor: isEditMode ? 'pointer' : 'default'
                 };
               }}
@@ -2579,6 +3527,85 @@ export default function App() {
                     L.DomEvent.stopPropagation(e);
                   }
                 }
+              }}
+            />
+          )}
+
+          {dgpsCandidates && showDgpsCandidates && (
+            <GeoJSON
+              key={`dgps-${dgpsCandidates.features.length}-${dgpsEditMode}-${removedGeneratedCandidateIds.size}-${manualDgpsPoints.length}-${selectedDgpsCandidateId}`}
+              data={dgpsCandidates as any}
+              pointToLayer={(feature, latlng) => {
+                const score = Number(feature.properties?.score ?? 0);
+                const candidateId = String(feature.properties?.candidateId ?? '');
+                const isSelected = candidateId === selectedDgpsCandidateId;
+                const color = score >= 80 ? '#16a34a' : score >= 65 ? '#22c55e' : '#84cc16';
+                return L.circleMarker(latlng, {
+                  radius: isSelected ? 7 : 5,
+                  color,
+                  fillColor: color,
+                  fillOpacity: 0.85,
+                  weight: isSelected ? 3 : 1.5
+                });
+              }}
+              onEachFeature={(feature, layer) => {
+                const rank = Number(feature.properties?.rank ?? 0);
+                const id = String(feature.properties?.candidateId ?? 'DGPS');
+                const score = Number(feature.properties?.score ?? 0).toFixed(1);
+                const scoreValue = Number(feature.properties?.score ?? 0);
+                const ndvi = Number(feature.properties?.ndvi ?? 0).toFixed(3);
+                const ndbi = Number(feature.properties?.ndbi ?? 0).toFixed(3);
+                const elev = Number(feature.properties?.elevationM ?? 0).toFixed(1);
+                const slope = Number(feature.properties?.slopeDeg ?? 0).toFixed(2);
+                const source = String(feature.properties?.source ?? 'generated');
+                const probability = (estimateDgpsSuitabilityProbability(scoreValue) * 100).toFixed(1);
+                const validation = dgpsValidationRecords[id]?.label ?? 'unlabeled';
+
+                layer.bindTooltip(
+                  `<div style="font-size:11px;line-height:1.35;">
+                    <div><strong>#${rank} ${id}</strong></div>
+                    <div>Score: ${score}</div>
+                    <div>Suitability: ${probability}%</div>
+                    <div>Validation: ${validation}</div>
+                    <div>Source: ${source}</div>
+                    <div>NDVI: ${ndvi}</div>
+                    <div>NDBI: ${ndbi}</div>
+                    <div>Elevation: ${elev} m</div>
+                    <div>Slope: ${slope} deg</div>
+                  </div>`,
+                  { sticky: true, opacity: 0.95 }
+                );
+
+                layer.on('click', () => {
+                  setSelectedDgpsCandidateId(id);
+                  if (dgpsEditMode !== 'remove') return;
+
+                  const candidateId = String(feature.properties?.candidateId ?? '');
+                  const sourceType = String(feature.properties?.source ?? 'generated');
+                  const featurePoint = feature as Feature<Point>;
+
+                  if (sourceType === 'manual') {
+                    setManualDgpsPoints(prev => prev.filter(
+                      p => String(p.properties?.candidateId) !== candidateId
+                    ));
+                    setDgpsEditHistory(prev => [...prev, {
+                      type: 'remove-manual',
+                      candidateId,
+                      candidate: featurePoint
+                    }]);
+                  } else {
+                    setRemovedGeneratedCandidateIds(prev => {
+                      const cloned = new Set(prev);
+                      cloned.add(candidateId);
+                      return cloned;
+                    });
+                    setDgpsEditHistory(prev => [...prev, {
+                      type: 'remove-generated',
+                      candidateId,
+                      candidate: featurePoint
+                    }]);
+                  }
+                });
               }}
             />
           )}
@@ -2872,6 +3899,10 @@ export default function App() {
               <div className="flex items-center gap-3">
                 <div className="w-8 h-4 bg-black/10 border border-dashed" style={{ borderColor: settings.boundaryColor }} />
                 <span className="text-xs text-black/80 font-medium">Survey Boundary</span>
+              </div>
+              <div className="flex items-center gap-3">
+                <div className="w-3 h-3 rounded-full bg-emerald-500" />
+                <span className="text-xs text-black/80 font-medium">DGPS Candidates</span>
               </div>
             </div>
             <div className="mt-4 pt-4 border-t border-black/5">
