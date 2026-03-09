@@ -1260,6 +1260,31 @@ export default function App() {
   };
 
   // Handlers
+  // UTM to Lat/Lng converter
+  const utmToLatLng = (easting: number, northing: number, zone: number = 47): { lat: number, lng: number } => {
+    // Simple UTM to WGS84 conversion
+    const k0 = 0.9996; // Scale factor
+    const M = northing / k0;
+    const mu = M / (6378137 * (1 - 1/298.257224 / 4 - 3 * Math.pow(1/298.257224, 2) / 64 - 5 * Math.pow(1/298.257224, 3) / 256));
+    
+    const p1 = mu + (3/2) * (1/298.257224) * Math.sin(2*mu) + (21/16) * Math.pow(1/298.257224, 2) * Math.sin(4*mu);
+    const p2 = (21/16) * Math.pow(1/298.257224, 2) * Math.sin(2*mu) * Math.sin(2*mu) + Math.pow(1/298.257224, 2) * Math.sin(2*mu);
+    const p3 = Math.sin(p1) * Math.cos(p1);
+    const p4 = Math.cos(p1) * Math.cos(p1);
+    const p5 = Math.tan(p1);
+    
+    const E = easting - 500000;
+    const N = E / k0 / (6378137 * Math.cos(p1));
+    
+    let lat = p1 - p3 * N * N / 2 + p3 * p4 * Math.pow(N, 4) / 24 * (5 - p5 * p5 + 9 * (1/298.257224) * p4);
+    let lng = (zone - 0.5) * 6 - 180 + (N - p4 * Math.pow(N, 3) / 6 + p4 * p4 * Math.pow(N, 5) / 120) / Math.cos(p1);
+    
+    lat = lat * 180 / Math.PI;
+    lng = lng * 180 / Math.PI;
+    
+    return { lat, lng };
+  };
+
   // Parse CSV line plan files
   const parseLinePlanCSV = (csvText: string): Feature<LineString>[] => {
     const lines = csvText.split('\n').map(l => l.trim()).filter(l => l);
@@ -1328,16 +1353,13 @@ export default function App() {
     // Identify which columns contain coordinates
     // Check first numeric row to identify column structure
     let coordColumns = { startLng: 3, startLat: 4, endLng: 5, endLat: 6 }; // Default
+    let isUTM = false;
+    let utmZone = 47; // Default for Thailand
     
     if (dataStartIdx > 0 && dataStartIdx < lines.length) {
       const firstDataFields = parseCSVLine(lines[dataStartIdx]);
       
       // Try to detect by column count and position
-      // Common formats:
-      // 1. LineID, Type, ..., StartLng, StartLat, EndLng, EndLat (fields 3-6)
-      // 2. LineID, Type, StartLng, StartLat, EndLng, EndLat (fields 2-5)
-      // 3. LineID, StartLng, StartLat, EndLng, EndLat (fields 1-4)
-      
       if (firstDataFields.length >= 7) {
         coordColumns = { startLng: 3, startLat: 4, endLng: 5, endLat: 6 };
       } else if (firstDataFields.length >= 6) {
@@ -1346,7 +1368,19 @@ export default function App() {
         coordColumns = { startLng: 1, startLat: 2, endLng: 3, endLat: 4 };
       }
       
-      console.log('Using coordinate columns:', coordColumns);
+      // Detect if coordinates are UTM (if values are > 1000)
+      const testVal1 = Math.abs(parseFloat(firstDataFields[coordColumns.startLng]?.replace(/"/g, '') || '0'));
+      const testVal2 = Math.abs(parseFloat(firstDataFields[coordColumns.startLat]?.replace(/"/g, '') || '0'));
+      
+      if (testVal1 > 1000 || testVal2 > 1000) {
+        isUTM = true;
+        // Guess UTM zone based on easting value (typical Thailand: zone 47-48)
+        if (testVal1 > 600000) utmZone = 48;  // Eastern Thailand
+        else if (testVal1 > 300000) utmZone = 47;  // Western/Central Thailand
+        console.log('Detected UTM coordinates, zone:', utmZone);
+      }
+      
+      console.log('Using coordinate columns:', coordColumns, 'isUTM:', isUTM);
     }
 
     for (let i = dataStartIdx; i < lines.length; i++) {
@@ -1377,6 +1411,16 @@ export default function App() {
           let startLat = coord2;
           let endLng = coord3;
           let endLat = coord4;
+
+          // Convert UTM to lat/lng if needed
+          if (isUTM) {
+            const start = utmToLatLng(coord1, coord2, utmZone);
+            const end = utmToLatLng(coord3, coord4, utmZone);
+            startLng = start.lng;
+            startLat = start.lat;
+            endLng = end.lng;
+            endLat = end.lat;
+          }
 
           // Validate coordinates are in reasonable range (lat/lng: -180 to 180, -90 to 90)
           if (
