@@ -66,7 +66,7 @@ interface PlanningSettings {
   tieLineSpacing: number;    // meters
   angle: number;             // degrees
   overlap: number;           // percentage (not used for line gen but good for UI)
-  importProjection: 'auto' | 'utm50n' | 'utm51n';
+  importProjection: 'auto' | 'utm50n' | 'utm51n' | 'utm52n';
   flightLineColor: string;
   tieLineColor: string;
   boundaryColor: string;
@@ -1419,7 +1419,7 @@ export default function App() {
     // Identify which columns contain coordinates.
     let coordColumns = { startLng: 1, startLat: 2, endLng: 3, endLat: 4 };
     let isUTM = false;
-    let utmZone = 51; // Default for Mindanao, Philippines
+    let utmZone = 51; // Default for Philippines
 
     const parseNum = (value?: string) => parseFloat((value || '').replace(/"/g, '').trim());
     const isNumericAt = (fields: string[], idx: number) => Number.isFinite(parseNum(fields[idx]));
@@ -1437,8 +1437,14 @@ export default function App() {
 
       const northingOffsets = [0, -10000000, -13000000, -14000000];
       const zones = settings.importProjection === 'auto'
-        ? [50, 51]
-        : [settings.importProjection === 'utm51n' ? 51 : 50];
+        ? [50, 51, 52]
+        : [
+            settings.importProjection === 'utm52n'
+              ? 52
+              : settings.importProjection === 'utm51n'
+                ? 51
+                : 50
+          ];
       let best: { lat: number; lng: number; score: number; meta: string } | null = null;
 
       for (const base of basePairs) {
@@ -1456,12 +1462,12 @@ export default function App() {
             let score = 0;
 
             // Broad Philippines bounds.
-            if (converted.lat >= 4 && converted.lat <= 21 && converted.lng >= 116 && converted.lng <= 127) {
+            if (converted.lat >= 4 && converted.lat <= 21 && converted.lng >= 116 && converted.lng <= 128.5) {
               score += 60;
             }
 
-            // Stronger preference for Mindanao where most projects are expected.
-            if (converted.lat >= 4 && converted.lat <= 10 && converted.lng >= 123 && converted.lng <= 127) {
+            // Stronger preference for plausible onshore PH corridors (country-wide, not region-specific).
+            if (converted.lat >= 6 && converted.lat <= 19 && converted.lng >= 118 && converted.lng <= 126.5) {
               score += 20;
             }
 
@@ -1469,9 +1475,9 @@ export default function App() {
             if (e >= 150000 && e <= 900000) score += 8;
             if (n >= 300000 && n <= 2500000) score += 8;
 
-            // Distance penalty from Mindanao centroid to break ties.
-            score -= Math.abs(converted.lat - 7.2) * 0.4;
-            score -= Math.abs(converted.lng - 125.5) * 0.2;
+            // Distance penalty from Philippines centroid to break ties.
+            score -= Math.abs(converted.lat - 12.5) * 0.4;
+            score -= Math.abs(converted.lng - 122.8) * 0.2;
 
             if (!best || score > best.score) {
               best = {
@@ -1551,9 +1557,11 @@ export default function App() {
       if (testVal1 > 1000 || testVal2 > 1000) {
         isUTM = true;
         // Keep a sensible default; final conversion uses zone/orientation candidates.
-        if (settings.importProjection === 'utm51n') utmZone = 51;
+        if (settings.importProjection === 'utm52n') utmZone = 52;
+        else if (settings.importProjection === 'utm51n') utmZone = 51;
         else if (settings.importProjection === 'utm50n') utmZone = 50;
-        else if (testVal1 > 700000) utmZone = 51;
+        else if (testVal1 > 750000) utmZone = 52;
+        else if (testVal1 > 600000) utmZone = 51;
         else utmZone = 50;
         console.log('Detected UTM coordinates, zone:', utmZone);
       }
@@ -2767,10 +2775,11 @@ export default function App() {
               >
                 <option value="auto">Auto Detect</option>
                 <option value="utm50n">UTM 50N (Philippines West)</option>
-                <option value="utm51n">UTM 51N (Mindanao / Philippines East)</option>
+                <option value="utm51n">UTM 51N (Philippines Central/East)</option>
+                <option value="utm52n">UTM 52N (Far East Philippines)</option>
               </select>
               <p className="mt-2 text-[10px] text-slate-500">
-                Use Auto for normal files. If offsets appear, force UTM zone 50N or 51N.
+                Use Auto for normal files. If offsets appear, force UTM zone 50N, 51N, or 52N.
               </p>
             </div>
 
