@@ -1424,79 +1424,104 @@ export default function App() {
     const parseNum = (value?: string) => parseFloat((value || '').replace(/"/g, '').trim());
     const isNumericAt = (fields: string[], idx: number) => Number.isFinite(parseNum(fields[idx]));
 
-    const convertProjectedPairToLatLng = (v1: number, v2: number): { lat: number; lng: number } | null => {
-      type Candidate = { e: number; n: number; zone: number; tag: string };
-      const basePairs = [
-        { e: v1, n: v2, tag: 'as-is' },
-        { e: v2, n: v1, tag: 'swapped' },
-        { e: v1 / 10, n: v2, tag: 'e/10' },
-        { e: v1, n: v2 / 10, tag: 'n/10' },
-        { e: v2 / 10, n: v1, tag: 'swapped-e/10' },
-        { e: v2, n: v1 / 10, tag: 'swapped-n/10' }
-      ];
+    type ProjectionTransform = {
+      swap: boolean;
+      scaleE: number;
+      scaleN: number;
+      zone: number;
+      northingOffset: number;
+      tag: string;
+    };
 
-      const northingOffsets = [0, -10000000, -13000000, -14000000];
-      const zones = settings.importProjection === 'auto'
-        ? [50, 51, 52]
-        : [
-            settings.importProjection === 'utm52n'
-              ? 52
-              : settings.importProjection === 'utm51n'
-                ? 51
-                : 50
-          ];
-      let best: { lat: number; lng: number; score: number; meta: string } | null = null;
+    const zones = settings.importProjection === 'auto'
+      ? [50, 51, 52]
+      : [
+          settings.importProjection === 'utm52n'
+            ? 52
+            : settings.importProjection === 'utm51n'
+              ? 51
+              : 50
+        ];
 
-      for (const base of basePairs) {
-        for (const zone of zones) {
-          for (const offset of northingOffsets) {
-            const e = base.e;
-            const n = base.n + offset;
-            if (!Number.isFinite(e) || !Number.isFinite(n)) continue;
-            if (e <= 0 || n <= 0) continue;
+    const transformCandidates: ProjectionTransform[] = [];
+    const baseModes = [
+      { swap: false, scaleE: 1, scaleN: 1, tag: 'as-is' },
+      { swap: true, scaleE: 1, scaleN: 1, tag: 'swapped' },
+      { swap: false, scaleE: 0.1, scaleN: 1, tag: 'e/10' },
+      { swap: false, scaleE: 1, scaleN: 0.1, tag: 'n/10' },
+      { swap: true, scaleE: 0.1, scaleN: 1, tag: 'swapped-e/10' },
+      { swap: true, scaleE: 1, scaleN: 0.1, tag: 'swapped-n/10' }
+    ];
+    const northingOffsets = [0, -10000000, -13000000, -14000000];
 
-            const converted = utmToLatLng(e, n, zone, true);
-            if (!Number.isFinite(converted.lat) || !Number.isFinite(converted.lng)) continue;
-            if (Math.abs(converted.lat) > 90 || Math.abs(converted.lng) > 180) continue;
+    for (const mode of baseModes) {
+      for (const zone of zones) {
+        for (const offset of northingOffsets) {
+          transformCandidates.push({
+            ...mode,
+            zone,
+            northingOffset: offset,
+            tag: `${mode.tag}|zone=${zone}|offset=${offset}`
+          });
+        }
+      }
+    }
 
-            let score = 0;
+    const applyProjectionTransform = (v1: number, v2: number, t: ProjectionTransform): { lat: number; lng: number; e: number; n: number } | null => {
+      const rawE = t.swap ? v2 : v1;
+      const rawN = t.swap ? v1 : v2;
+      const e = rawE * t.scaleE;
+      const n = rawN * t.scaleN + t.northingOffset;
 
-            // Broad Philippines bounds.
-            if (converted.lat >= 4 && converted.lat <= 21 && converted.lng >= 116 && converted.lng <= 128.5) {
-              score += 60;
-            }
+      if (!Number.isFinite(e) || !Number.isFinite(n)) return null;
+      if (e <= 0 || n <= 0) return null;
 
-            // Stronger preference for plausible onshore PH corridors (country-wide, not region-specific).
-            if (converted.lat >= 6 && converted.lat <= 19 && converted.lng >= 118 && converted.lng <= 126.5) {
-              score += 20;
-            }
+      const converted = utmToLatLng(e, n, t.zone, true);
+      if (!Number.isFinite(converted.lat) || !Number.isFinite(converted.lng)) return null;
+      if (Math.abs(converted.lat) > 90 || Math.abs(converted.lng) > 180) return null;
 
-            // Bias toward common Easting/Northing magnitudes.
-            if (e >= 150000 && e <= 900000) score += 8;
-            if (n >= 300000 && n <= 2500000) score += 8;
+      return { lat: converted.lat, lng: converted.lng, e, n };
+    };
 
-            // Distance penalty from Philippines centroid to break ties.
-            score -= Math.abs(converted.lat - 12.5) * 0.4;
-            score -= Math.abs(converted.lng - 122.8) * 0.2;
+    const scoreConvertedPoint = (lat: number, lng: number, e: number, n: number) => {
+      let score = 0;
+      if (lat >= 4 && lat <= 21 && lng >= 116 && lng <= 128.5) score += 60; // PH bounds
+      if (lat >= 6 && lat <= 19 && lng >= 118 && lng <= 126.5) score += 20; // Onshore tendency
+      if (e >= 150000 && e <= 900000) score += 8;
+      if (n >= 300000 && n <= 2500000) score += 8;
+      score -= Math.abs(lat - 12.5) * 0.4;
+      score -= Math.abs(lng - 122.8) * 0.2;
+      return score;
+    };
 
-            if (!best || score > best.score) {
-              best = {
-                lat: converted.lat,
-                lng: converted.lng,
-                score,
-                meta: `${base.tag}|zone=${zone}|offset=${offset}`
-              };
-            }
-          }
+    const resolveBestTransform = (samplePairs: Array<{ x: number; y: number }>) => {
+      if (samplePairs.length === 0) return null;
+
+      let best: { transform: ProjectionTransform; score: number; valid: number } | null = null;
+      for (const t of transformCandidates) {
+        let total = 0;
+        let valid = 0;
+
+        for (const p of samplePairs) {
+          const converted = applyProjectionTransform(p.x, p.y, t);
+          if (!converted) continue;
+          valid += 1;
+          total += scoreConvertedPoint(converted.lat, converted.lng, converted.e, converted.n);
+        }
+
+        if (valid === 0) continue;
+        const avgScore = total / valid;
+        const validRatio = valid / samplePairs.length;
+        if (validRatio < 0.6) continue;
+
+        if (!best || avgScore > best.score) {
+          best = { transform: t, score: avgScore, valid };
         }
       }
 
-      if (best) {
-        console.log('Projected conversion selected:', best.meta, best.lat, best.lng);
-        return { lat: best.lat, lng: best.lng };
-      }
-
-      return null;
+      if (!best) return null;
+      console.log(`Projected transform selected for file: ${best.transform.tag} (avgScore=${best.score.toFixed(2)}, valid=${best.valid}/${samplePairs.length})`);
+      return best.transform;
     };
     
     if (dataStartIdx > 0 && dataStartIdx < lines.length) {
@@ -1569,6 +1594,26 @@ export default function App() {
       console.log('Using coordinate columns:', coordColumns, 'isUTM:', isUTM);
     }
 
+    let chosenTransform: ProjectionTransform | null = null;
+    if (isUTM) {
+      const samplePairs: Array<{ x: number; y: number }> = [];
+      for (let i = dataStartIdx; i < lines.length && samplePairs.length < 24; i++) {
+        const fields = parseCSVLine(lines[i]);
+        if (fields.length < 5) continue;
+        const sx = parseNum(fields[coordColumns.startLng]);
+        const sy = parseNum(fields[coordColumns.startLat]);
+        const ex = parseNum(fields[coordColumns.endLng]);
+        const ey = parseNum(fields[coordColumns.endLat]);
+        if (Number.isFinite(sx) && Number.isFinite(sy) && Number.isFinite(ex) && Number.isFinite(ey)) {
+          samplePairs.push({ x: sx, y: sy }, { x: ex, y: ey });
+        }
+      }
+      chosenTransform = resolveBestTransform(samplePairs);
+      if (!chosenTransform) {
+        console.warn('No robust projected transform found from sample points; import may skip invalid rows.');
+      }
+    }
+
     for (let i = dataStartIdx; i < lines.length; i++) {
       const line = lines[i];
       if (!line) continue;
@@ -1600,8 +1645,10 @@ export default function App() {
 
           // Convert projected coordinates to lat/lng if needed
           if (isUTM) {
-            const start = convertProjectedPairToLatLng(coord1, coord2);
-            const end = convertProjectedPairToLatLng(coord3, coord4);
+            const transform = chosenTransform;
+            if (!transform) continue;
+            const start = applyProjectionTransform(coord1, coord2, transform);
+            const end = applyProjectionTransform(coord3, coord4, transform);
             if (!start || !end) continue;
             startLng = start.lng;
             startLat = start.lat;
