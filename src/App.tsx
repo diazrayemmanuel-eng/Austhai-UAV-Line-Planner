@@ -66,7 +66,7 @@ interface PlanningSettings {
   tieLineSpacing: number;    // meters
   angle: number;             // degrees
   overlap: number;           // percentage (not used for line gen but good for UI)
-  importProjection: 'auto' | 'utm47n' | 'utm48n';
+  importProjection: 'auto' | 'utm50n' | 'utm51n';
   flightLineColor: string;
   tieLineColor: string;
   boundaryColor: string;
@@ -1301,7 +1301,7 @@ export default function App() {
 
   // Handlers
   // UTM to Lat/Lng converter
-  const utmToLatLng = (easting: number, northing: number, zone: number = 47, isNorthern: boolean = true): { lat: number, lng: number } => {
+  const utmToLatLng = (easting: number, northing: number, zone: number = 51, isNorthern: boolean = true): { lat: number, lng: number } => {
     // WGS84 ellipsoid parameters
     const a = 6378137; // semi-major axis in meters
     const b = 6356752.314245; // semi-minor axis in meters
@@ -1419,7 +1419,7 @@ export default function App() {
     // Identify which columns contain coordinates.
     let coordColumns = { startLng: 1, startLat: 2, endLng: 3, endLat: 4 };
     let isUTM = false;
-    let utmZone = 47; // Default for Thailand
+    let utmZone = 51; // Default for Mindanao, Philippines
 
     const parseNum = (value?: string) => parseFloat((value || '').replace(/"/g, '').trim());
     const isNumericAt = (fields: string[], idx: number) => Number.isFinite(parseNum(fields[idx]));
@@ -1437,8 +1437,8 @@ export default function App() {
 
       const northingOffsets = [0, -10000000, -13000000, -14000000];
       const zones = settings.importProjection === 'auto'
-        ? [47, 48]
-        : [settings.importProjection === 'utm48n' ? 48 : 47];
+        ? [50, 51]
+        : [settings.importProjection === 'utm51n' ? 51 : 50];
       let best: { lat: number; lng: number; score: number; meta: string } | null = null;
 
       for (const base of basePairs) {
@@ -1455,13 +1455,13 @@ export default function App() {
 
             let score = 0;
 
-            // Broad Thailand bounds.
-            if (converted.lat >= 4 && converted.lat <= 22 && converted.lng >= 97 && converted.lng <= 106) {
+            // Broad Philippines bounds.
+            if (converted.lat >= 4 && converted.lat <= 21 && converted.lng >= 116 && converted.lng <= 127) {
               score += 60;
             }
 
-            // Stronger preference for central Thailand where most projects are expected.
-            if (converted.lat >= 10 && converted.lat <= 18 && converted.lng >= 98 && converted.lng <= 104) {
+            // Stronger preference for Mindanao where most projects are expected.
+            if (converted.lat >= 4 && converted.lat <= 10 && converted.lng >= 123 && converted.lng <= 127) {
               score += 20;
             }
 
@@ -1469,9 +1469,9 @@ export default function App() {
             if (e >= 150000 && e <= 900000) score += 8;
             if (n >= 300000 && n <= 2500000) score += 8;
 
-            // Distance penalty from typical Thai centroid to break ties.
-            score -= Math.abs(converted.lat - 13) * 0.4;
-            score -= Math.abs(converted.lng - 101) * 0.2;
+            // Distance penalty from Mindanao centroid to break ties.
+            score -= Math.abs(converted.lat - 7.2) * 0.4;
+            score -= Math.abs(converted.lng - 125.5) * 0.2;
 
             if (!best || score > best.score) {
               best = {
@@ -1551,10 +1551,10 @@ export default function App() {
       if (testVal1 > 1000 || testVal2 > 1000) {
         isUTM = true;
         // Keep a sensible default; final conversion uses zone/orientation candidates.
-        if (settings.importProjection === 'utm48n') utmZone = 48;
-        else if (settings.importProjection === 'utm47n') utmZone = 47;
-        else if (testVal1 > 700000) utmZone = 48;
-        else utmZone = 47;
+        if (settings.importProjection === 'utm51n') utmZone = 51;
+        else if (settings.importProjection === 'utm50n') utmZone = 50;
+        else if (testVal1 > 700000) utmZone = 51;
+        else utmZone = 50;
         console.log('Detected UTM coordinates, zone:', utmZone);
       }
       
@@ -2766,11 +2766,11 @@ export default function App() {
                 className="w-full px-3 py-2 rounded-lg border border-slate-300 bg-white text-xs text-slate-700"
               >
                 <option value="auto">Auto Detect</option>
-                <option value="utm47n">UTM 47N (Thailand West/Central)</option>
-                <option value="utm48n">UTM 48N (Thailand East)</option>
+                <option value="utm50n">UTM 50N (Philippines West)</option>
+                <option value="utm51n">UTM 51N (Mindanao / Philippines East)</option>
               </select>
               <p className="mt-2 text-[10px] text-slate-500">
-                Use Auto for normal files. If offsets appear, force UTM zone 47N or 48N.
+                Use Auto for normal files. If offsets appear, force UTM zone 50N or 51N.
               </p>
             </div>
 
