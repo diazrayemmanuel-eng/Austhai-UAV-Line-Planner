@@ -1265,19 +1265,10 @@ export default function App() {
     const lines = csvText.split('\n').map(l => l.trim()).filter(l => l);
     const features: Feature<LineString>[] = [];
     
-    // Skip header rows and find data start
-    let dataStartIndex = 0;
-    for (let i = 0; i < lines.length; i++) {
-      // Look for lines that start with a number or quote followed by number (line IDs)
-      if (/^"?\d+/.test(lines[i]) || /^FL|^TL|^LINE/i.test(lines[i])) {
-        dataStartIndex = i;
-        break;
-      }
-    }
-    
-    for (let i = dataStartIndex; i < lines.length; i++) {
-      const line = lines[i];
-      // Parse CSV line (handle quoted fields)
+    if (lines.length === 0) return features;
+
+    // Helper to parse CSV fields (handle quoted fields)
+    const parseCSVLine = (line: string): string[] => {
       const fields: string[] = [];
       let inQuote = false;
       let field = '';
@@ -1294,49 +1285,121 @@ export default function App() {
         }
       }
       fields.push(field.trim());
-      
-      // Try to extract coordinates
-      // Expected formats: LineID, Type, Length, StartLat/StartLng or StartEasting/StartNorthing, EndLat/EndLng or EndEasting/EndNorthing
-      if (fields.length >= 5) {
-        const lineId = fields[0].replace(/"/g, '');
-        const lineType = fields[1]?.replace(/"/g, '') || 'flight';
-        
-        // Try to parse coordinates (fields 3-6 are typically start/end coords)
-        const coord1 = parseFloat(fields[3]?.replace(/"/g, '') || '0');
-        const coord2 = parseFloat(fields[4]?.replace(/"/g, '') || '0');
-        const coord3 = parseFloat(fields[5]?.replace(/"/g, '') || '0');
-        const coord4 = parseFloat(fields[6]?.replace(/"/g, '') || '0');
-        
-        if (!isNaN(coord1) && !isNaN(coord2) && !isNaN(coord3) && !isNaN(coord4)) {
-          let startLng, startLat, endLng, endLat;
-          
-          // Determine if coords are lat/lng or UTM easting/northing
-          // Lat/lng: typically -180 to 180, -90 to 90
-          // UTM: much larger numbers (100000+)
-          if (Math.abs(coord1) < 360 && Math.abs(coord2) < 360) {
-            // Assume lat/lng format: lng, lat
-            startLng = coord1;
-            startLat = coord2;
-            endLng = coord3;
-            endLat = coord4;
-          } else {
-            // Skip UTM conversion for now - would need zone info
-            continue;
+      return fields;
+    };
+
+    // Scan for header and data rows
+    let headerIdx = -1;
+    let dataStartIdx = 0;
+
+    // Look for header row (contains text like StartLat, StartLng, etc.)
+    const headerPatterns = /start|end|lat|lng|easting|northing|x|y|lon|longitude|latitude/i;
+    for (let i = 0; i < Math.min(10, lines.length); i++) {
+      const fields = parseCSVLine(lines[i]);
+      let matchCount = 0;
+      fields.forEach(f => {
+        if (headerPatterns.test(f)) matchCount++;
+      });
+      if (matchCount >= 2) {
+        headerIdx = i;
+        dataStartIdx = i + 1;
+        console.log('Detected CSV header at line', i, ':', fields);
+        break;
+      }
+    }
+
+    // If no header found, assume first data row at line 0 or skip detection
+    if (headerIdx === -1) {
+      // Scan for first line with numeric coordinates
+      for (let i = 0; i < Math.min(10, lines.length); i++) {
+        const fields = parseCSVLine(lines[i]);
+        if (fields.length >= 5) {
+          // Try to find numeric fields
+          const numericCount = fields.filter(f => !isNaN(parseFloat(f))).length;
+          if (numericCount >= 4) {
+            dataStartIdx = i;
+            console.log('Detected data start at line', i);
+            break;
           }
-          
-          const feature = turf.lineString(
-            [[startLng, startLat], [endLng, endLat]],
-            {
-              id: lineId,
-              type: lineType,
-              source: 'imported'
-            }
-          );
-          features.push(feature);
         }
       }
     }
+
+    // Identify which columns contain coordinates
+    // Check first numeric row to identify column structure
+    let coordColumns = { startLng: 3, startLat: 4, endLng: 5, endLat: 6 }; // Default
     
+    if (dataStartIdx > 0 && dataStartIdx < lines.length) {
+      const firstDataFields = parseCSVLine(lines[dataStartIdx]);
+      
+      // Try to detect by column count and position
+      // Common formats:
+      // 1. LineID, Type, ..., StartLng, StartLat, EndLng, EndLat (fields 3-6)
+      // 2. LineID, Type, StartLng, StartLat, EndLng, EndLat (fields 2-5)
+      // 3. LineID, StartLng, StartLat, EndLng, EndLat (fields 1-4)
+      
+      if (firstDataFields.length >= 7) {
+        coordColumns = { startLng: 3, startLat: 4, endLng: 5, endLat: 6 };
+      } else if (firstDataFields.length >= 6) {
+        coordColumns = { startLng: 2, startLat: 3, endLng: 4, endLat: 5 };
+      } else if (firstDataFields.length >= 5) {
+        coordColumns = { startLng: 1, startLat: 2, endLng: 3, endLat: 4 };
+      }
+      
+      console.log('Using coordinate columns:', coordColumns);
+    }
+
+    for (let i = dataStartIdx; i < lines.length; i++) {
+      const line = lines[i];
+      if (!line) continue;
+
+      const fields = parseCSVLine(line);
+
+      if (fields.length < 5) continue;
+
+      try {
+        const lineId = fields[0]?.replace(/"/g, '') || `line-${i}`;
+        const lineType = fields[1]?.replace(/"/g, '') || 'flight';
+
+        // Extract coordinates with fallback
+        const coord1Str = fields[coordColumns.startLng]?.replace(/"/g, '') || '0';
+        const coord2Str = fields[coordColumns.startLat]?.replace(/"/g, '') || '0';
+        const coord3Str = fields[coordColumns.endLng]?.replace(/"/g, '') || '0';
+        const coord4Str = fields[coordColumns.endLat]?.replace(/"/g, '') || '0';
+
+        const coord1 = parseFloat(coord1Str);
+        const coord2 = parseFloat(coord2Str);
+        const coord3 = parseFloat(coord3Str);
+        const coord4 = parseFloat(coord4Str);
+
+        if (!isNaN(coord1) && !isNaN(coord2) && !isNaN(coord3) && !isNaN(coord4)) {
+          let startLng = coord1;
+          let startLat = coord2;
+          let endLng = coord3;
+          let endLat = coord4;
+
+          // Validate coordinates are in reasonable range (lat/lng: -180 to 180, -90 to 90)
+          if (
+            Math.abs(startLng) <= 180 && Math.abs(startLat) <= 90 &&
+            Math.abs(endLng) <= 180 && Math.abs(endLat) <= 90
+          ) {
+            const feature = turf.lineString(
+              [[startLng, startLat], [endLng, endLat]],
+              {
+                id: lineId,
+                type: lineType,
+                source: 'imported'
+              }
+            );
+            features.push(feature);
+          }
+        }
+      } catch (err: any) {
+        console.warn(`Error parsing line ${i}:`, err);
+      }
+    }
+
+    console.log(`Parsed ${features.length} line features from CSV`);
     return features;
   };
 
