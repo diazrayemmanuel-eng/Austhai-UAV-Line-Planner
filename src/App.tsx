@@ -699,8 +699,8 @@ export default function App() {
     tieLineSpacing: 100,
     angle: 0,
     overlap: 70,
-    flightLineColor: '#2563eb', // blue-600
-    tieLineColor: '#64748b',    // slate-500
+    flightLineColor: '#FFFF00', // yellow
+    tieLineColor: '#40E0D0',    // turquoise blue
     boundaryColor: '#0f172a',   // slate-900
     swapDirections: false,
     gridOffsetX: 0,
@@ -1261,26 +1261,41 @@ export default function App() {
 
   // Handlers
   // UTM to Lat/Lng converter
-  const utmToLatLng = (easting: number, northing: number, zone: number = 47): { lat: number, lng: number } => {
-    // Simple UTM to WGS84 conversion
-    const k0 = 0.9996; // Scale factor
-    const M = northing / k0;
-    const mu = M / (6378137 * (1 - 1/298.257224 / 4 - 3 * Math.pow(1/298.257224, 2) / 64 - 5 * Math.pow(1/298.257224, 3) / 256));
+  const utmToLatLng = (easting: number, northing: number, zone: number = 47, isNorthern: boolean = true): { lat: number, lng: number } => {
+    // WGS84 ellipsoid parameters
+    const a = 6378137; // semi-major axis in meters
+    const b = 6356752.314245; // semi-minor axis in meters
+    const e2 = 1 - (b * b) / (a * a); // first eccentricity squared
+    const e = Math.sqrt(e2);
     
-    const p1 = mu + (3/2) * (1/298.257224) * Math.sin(2*mu) + (21/16) * Math.pow(1/298.257224, 2) * Math.sin(4*mu);
-    const p2 = (21/16) * Math.pow(1/298.257224, 2) * Math.sin(2*mu) * Math.sin(2*mu) + Math.pow(1/298.257224, 2) * Math.sin(2*mu);
-    const p3 = Math.sin(p1) * Math.cos(p1);
-    const p4 = Math.cos(p1) * Math.cos(p1);
-    const p5 = Math.tan(p1);
+    const k0 = 0.9996; // scale factor
+    const x = easting - 500000; // remove false easting
+    const y = isNorthern ? northing : northing - 10000000; // remove false northing
     
-    const E = easting - 500000;
-    const N = E / k0 / (6378137 * Math.cos(p1));
+    const m = y / k0;
+    const e1 = (1 - Math.sqrt(1 - e2)) / (1 + Math.sqrt(1 - e2));
     
-    let lat = p1 - p3 * N * N / 2 + p3 * p4 * Math.pow(N, 4) / 24 * (5 - p5 * p5 + 9 * (1/298.257224) * p4);
-    let lng = (zone - 0.5) * 6 - 180 + (N - p4 * Math.pow(N, 3) / 6 + p4 * p4 * Math.pow(N, 5) / 120) / Math.cos(p1);
+    const mu = m / (a * (1 - e2/4 - 3*e2*e2/64 - 5*e2*e2*e2/256));
+    const p1 = mu + (3*e1/2 - 27*e1*e1*e1/32) * Math.sin(2*mu) 
+                  + (21*e1*e1/16 - 55*e1*e1*e1*e1/32) * Math.sin(4*mu)
+                  + (151*e1*e1*e1/96) * Math.sin(6*mu)
+                  + (1097*e1*e1*e1*e1/512) * Math.sin(8*mu);
+    
+    const p2 = Math.cos(p1);
+    const t = Math.tan(p1);
+    const t2 = t * t;
+    const n = a / Math.sqrt(1 - e2 * p2 * p2);
+    const c = e2 * p2 * p2 / (1 - e2);
+    const r = a * (1 - e2) / Math.sqrt((1 - e2 * p2 * p2) * (1 - e2 * p2 * p2));
+    const d = x / (n * k0);
+    
+    let lat = p1 - (t / r) * (d*d/2 - (d*d*d*d/24) * (5 + 3*t2 + 10*c - 4*c*c - 9*e2));
+    lat += (t / r) * (d*d*d*d*d*d/720) * (61 + 90*t2 + 28*t2*t2 + 45*t2*t2*t2 - 252*e2 - 3*c);
+    
+    let lng = (d - (d*d*d/6) * (1 + 2*t2 + c) + (d*d*d*d*d/120) * (1 + 6*t2 + 120*c - 58*e2)) / p2;
+    lng = ((zone - 0.5) * 6 - 180 + lng * 180 / Math.PI);
     
     lat = lat * 180 / Math.PI;
-    lng = lng * 180 / Math.PI;
     
     return { lat, lng };
   };
@@ -1942,8 +1957,8 @@ export default function App() {
     };
 
     // Fixed colors for KML export (Google Earth display)
-    const flightLineColor = '#40E0D0'; // Turquoise blue
-    const tieLineColor = '#FFFF00';    // Yellow
+    const flightLineColor = '#FFFF00'; // Yellow
+    const tieLineColor = '#40E0D0';    // Turquoise blue
     const boundaryColor = '#FF0000';   // Red
 
     // KML header with styles
