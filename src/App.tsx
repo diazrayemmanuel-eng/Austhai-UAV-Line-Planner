@@ -66,6 +66,7 @@ interface PlanningSettings {
   tieLineSpacing: number;    // meters
   angle: number;             // degrees
   overlap: number;           // percentage (not used for line gen but good for UI)
+  importProjection: 'auto' | 'utm47n' | 'utm48n';
   flightLineColor: string;
   tieLineColor: string;
   boundaryColor: string;
@@ -699,6 +700,7 @@ export default function App() {
     tieLineSpacing: 100,
     angle: 0,
     overlap: 70,
+    importProjection: 'auto',
     flightLineColor: '#FFFF00', // yellow
     tieLineColor: '#40E0D0',    // turquoise blue
     boundaryColor: '#0f172a',   // slate-900
@@ -1434,7 +1436,9 @@ export default function App() {
       ];
 
       const northingOffsets = [0, -10000000, -13000000, -14000000];
-      const zones = [47, 48];
+      const zones = settings.importProjection === 'auto'
+        ? [47, 48]
+        : [settings.importProjection === 'utm48n' ? 48 : 47];
       let best: { lat: number; lng: number; score: number; meta: string } | null = null;
 
       for (const base of basePairs) {
@@ -1547,7 +1551,9 @@ export default function App() {
       if (testVal1 > 1000 || testVal2 > 1000) {
         isUTM = true;
         // Keep a sensible default; final conversion uses zone/orientation candidates.
-        if (testVal1 > 700000) utmZone = 48;
+        if (settings.importProjection === 'utm48n') utmZone = 48;
+        else if (settings.importProjection === 'utm47n') utmZone = 47;
+        else if (testVal1 > 700000) utmZone = 48;
         else utmZone = 47;
         console.log('Detected UTM coordinates, zone:', utmZone);
       }
@@ -1980,7 +1986,7 @@ export default function App() {
             lineNumber: i + 1,
             name: `Flight Line ${i + 1}`,
             stroke: settings.flightLineColor,
-            'stroke-width': 3,
+            'stroke-width': 1.6,
             'stroke-opacity': 1
           }
         };
@@ -2009,7 +2015,7 @@ export default function App() {
             lineNumber: i + 1,
             name: `Tie Line ${i + 1}`,
             stroke: settings.tieLineColor,
-            'stroke-width': 1.5,
+            'stroke-width': 2,
             'stroke-opacity': 0.8,
             'stroke-dasharray': '4, 4'
           }
@@ -2071,7 +2077,7 @@ export default function App() {
           lineNumber: idx + 1,
           name: `Flight Line ${idx + 1}`,
           stroke: settings.flightLineColor,
-          'stroke-width': 3,
+          'stroke-width': 1.6,
           'stroke-opacity': 1,
           source: f.properties?.source || 'generated'
         } 
@@ -2084,7 +2090,7 @@ export default function App() {
           lineNumber: idx + 1,
           name: `Tie Line ${idx + 1}`,
           stroke: settings.tieLineColor,
-          'stroke-width': 1.5,
+          'stroke-width': 2,
           'stroke-opacity': 0.8,
           'stroke-dasharray': '4, 4',
           source: f.properties?.source || 'generated'
@@ -2137,14 +2143,14 @@ export default function App() {
     kml += '  <Style id="flightLineStyle">\n';
     kml += '    <LineStyle>\n';
     kml += `      <color>${hexToKmlColor(flightLineColor, 1)}</color>\n`;
-    kml += '      <width>1.5</width>\n';
+    kml += '      <width>1.6</width>\n';
     kml += '    </LineStyle>\n';
     kml += '  </Style>\n\n';
 
     kml += '  <Style id="tieLineStyle">\n';
     kml += '    <LineStyle>\n';
     kml += `      <color>${hexToKmlColor(tieLineColor, 1)}</color>\n`;
-    kml += '      <width>2.5</width>\n';
+    kml += '      <width>2</width>\n';
     kml += '    </LineStyle>\n';
     kml += '  </Style>\n\n';
 
@@ -2746,6 +2752,27 @@ export default function App() {
                 multiple 
               />
             </label>
+
+            <div className="rounded-lg border border-slate-200 p-3 bg-slate-50">
+              <label className="block text-[10px] uppercase tracking-widest text-slate-500 mb-2 font-mono">
+                Import Projection
+              </label>
+              <select
+                value={settings.importProjection}
+                onChange={(e) => setSettings(s => ({
+                  ...s,
+                  importProjection: e.target.value as PlanningSettings['importProjection']
+                }))}
+                className="w-full px-3 py-2 rounded-lg border border-slate-300 bg-white text-xs text-slate-700"
+              >
+                <option value="auto">Auto Detect</option>
+                <option value="utm47n">UTM 47N (Thailand West/Central)</option>
+                <option value="utm48n">UTM 48N (Thailand East)</option>
+              </select>
+              <p className="mt-2 text-[10px] text-slate-500">
+                Use Auto for normal files. If offsets appear, force UTM zone 47N or 48N.
+              </p>
+            </div>
 
             {/* Uploaded Files List */}
             {uploadedFiles.length > 0 && (
