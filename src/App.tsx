@@ -1340,6 +1340,46 @@ export default function App() {
     return { lat, lng };
   };
 
+  const latLngToUTM = (lat: number, lng: number, zone?: number): { easting: number, northing: number, zone: number } => {
+    // WGS84 ellipsoid parameters
+    const a = 6378137; // semi-major axis in meters
+    const e2 = 0.00669437999014; // first eccentricity squared
+    const k0 = 0.9996; // scale factor
+    
+    // Auto-detect zone if not provided
+    if (!zone) {
+      zone = Math.floor((lng + 180) / 6) + 1;
+    }
+    
+    const latRad = lat * Math.PI / 180;
+    const lngRad = lng * Math.PI / 180;
+    const centralMeridian = ((zone - 0.5) * 6 - 180) * Math.PI / 180;
+    
+    const n = a / Math.sqrt(1 - e2 * Math.sin(latRad) * Math.sin(latRad));
+    const t = Math.tan(latRad);
+    const t2 = t * t;
+    const c = e2 * Math.cos(latRad) * Math.cos(latRad) / (1 - e2);
+    const A = (lngRad - centralMeridian) * Math.cos(latRad);
+    
+    const m = a * ((1 - e2/4 - 3*e2*e2/64 - 5*e2*e2*e2/256) * latRad
+                  - (3*e2/8 + 3*e2*e2/32 + 45*e2*e2*e2/1024) * Math.sin(2*latRad)
+                  + (15*e2*e2/256 + 45*e2*e2*e2/1024) * Math.sin(4*latRad)
+                  - (35*e2*e2*e2/3072) * Math.sin(6*latRad));
+    
+    const easting = k0 * n * (A + (1 - t2 + c) * A*A*A/6
+                    + (5 - 18*t2 + t2*t2 + 72*c - 58*e2) * A*A*A*A*A/120) + 500000;
+    
+    let northing = k0 * (m + n * t * (A*A/2 + (5 - t2 + 9*c + 4*c*c) * A*A*A*A/24
+                   + (61 - 58*t2 + t2*t2 + 600*c - 330*e2) * A*A*A*A*A*A/720));
+    
+    // For southern hemisphere, add false northing
+    if (lat < 0) {
+      northing += 10000000;
+    }
+    
+    return { easting, northing, zone };
+  };
+
   // Parse CSV line plan files
   const parseLinePlanCSV = (csvText: string): Feature<LineString>[] => {
     const lines = csvText.split('\n').map(l => l.trim()).filter(l => l);
@@ -1926,30 +1966,6 @@ export default function App() {
     setImportedLinesFileName('');
   };
 
-  const latLngToUTM = (lat: number, lng: number) => {
-    const WGS84_A = 6378137.0;
-    const WGS84_E2 = 0.00669438;
-    
-    const utmZone = Math.floor((lng + 180) / 6) + 1;
-    const lon0 = (utmZone - 1) * 6 - 180 + 3;
-    const lon0Rad = lon0 * Math.PI / 180;
-    const latRad = lat * Math.PI / 180;
-    const lngRad = lng * Math.PI / 180;
-    
-    const N = WGS84_A / Math.sqrt(1 - WGS84_E2 * Math.sin(latRad) * Math.sin(latRad));
-    const T = Math.tan(latRad) * Math.tan(latRad);
-    const C = WGS84_E2 / (1 - WGS84_E2) * Math.cos(latRad) * Math.cos(latRad);
-    const A = Math.cos(latRad) * ((lngRad - lon0Rad) % (2 * Math.PI));
-    const M = WGS84_A * ((1 - WGS84_E2 / 4 - 3 * WGS84_E2 * WGS84_E2 / 64) * latRad - 
-             (3 * WGS84_E2 / 8 + 3 * WGS84_E2 * WGS84_E2 / 64) * Math.sin(2 * latRad) +
-             (15 * WGS84_E2 * WGS84_E2 / 256) * Math.sin(4 * latRad));
-    
-    const easting = 500000 + 0.9996 * N * (A + A * A * A / 6 * (1 - T + C));
-    const northing = 0.9996 * (M + N * Math.tan(latRad) * (A * A / 2 + A * A * A * A / 24 * (5 - T + 9 * C + 4 * C * C)));
-    
-    return { easting: Math.round(easting), northing: Math.round(northing) };
-  };
-
   const generateSummaryCSV = () => {
     if (!allFlightLines || !allTieLines || !stats) return '';
     const baseName = fileName ? fileName.split('.')[0] : 'drone-plan';
@@ -1994,8 +2010,8 @@ export default function App() {
     if (!allFlightLines || !allTieLines) return '';
     
     let csv = '';
-    csv += '"Line ID","Type","Length (km)","Source","START","","END",""\n';
-    csv += '"","","","","Longitude","Latitude","Longitude","Latitude"\n';
+    csv += '"Line ID","Type","Length (km)","START","","END",""\n';
+    csv += '"","","","Easting","Northing","Easting","Northing"\n';
     
     allFlightLines.features.forEach((feature, idx) => {
       const coords = feature.geometry.coordinates;
@@ -2004,9 +2020,12 @@ export default function App() {
       const startLat = coords[0][1];
       const endLng = coords[coords.length - 1][0];
       const endLat = coords[coords.length - 1][1];
-      const source = feature.properties?.source || 'generated';
       
-      csv += `"FL-${idx + 1}","Flight Line","${lineLength.toFixed(4)}","${source}","${startLng.toFixed(6)}","${startLat.toFixed(6)}","${endLng.toFixed(6)}","${endLat.toFixed(6)}"\n`;
+      // Convert lat/lng to UTM
+      const startUTM = latLngToUTM(startLat, startLng);
+      const endUTM = latLngToUTM(endLat, endLng);
+      
+      csv += `"FL-${idx + 1}","Flight Line","${lineLength.toFixed(4)}","${startUTM.easting.toFixed(2)}","${startUTM.northing.toFixed(2)}","${endUTM.easting.toFixed(2)}","${endUTM.northing.toFixed(2)}"\n`;
     });
     
     allTieLines.features.forEach((feature, idx) => {
@@ -2016,9 +2035,12 @@ export default function App() {
       const startLat = coords[0][1];
       const endLng = coords[coords.length - 1][0];
       const endLat = coords[coords.length - 1][1];
-      const source = feature.properties?.source || 'generated';
       
-      csv += `"TL-${idx + 1}","Tie Line","${lineLength.toFixed(4)}","${source}","${startLng.toFixed(6)}","${startLat.toFixed(6)}","${endLng.toFixed(6)}","${endLat.toFixed(6)}"\n`;
+      // Convert lat/lng to UTM
+      const startUTM = latLngToUTM(startLat, startLng);
+      const endUTM = latLngToUTM(endLat, endLng);
+      
+      csv += `"TL-${idx + 1}","Tie Line","${lineLength.toFixed(4)}","${startUTM.easting.toFixed(2)}","${startUTM.northing.toFixed(2)}","${endUTM.easting.toFixed(2)}","${endUTM.northing.toFixed(2)}"\n`;
     });
     
     return csv;
