@@ -1433,6 +1433,14 @@ export default function App() {
       tag: string;
     };
 
+    type SampleSegment = {
+      sx: number;
+      sy: number;
+      ex: number;
+      ey: number;
+      lengthKm?: number;
+    };
+
     const zones = settings.importProjection === 'auto'
       ? [50, 51, 52]
       : [
@@ -1447,6 +1455,9 @@ export default function App() {
     const baseModes = [
       { swap: false, scaleE: 1, scaleN: 1, tag: 'as-is' },
       { swap: true, scaleE: 1, scaleN: 1, tag: 'swapped' },
+      // Some planning sheets store projected coordinates in feet; convert to meters.
+      { swap: false, scaleE: 0.3048, scaleN: 0.3048, tag: 'as-is-feet' },
+      { swap: true, scaleE: 0.3048, scaleN: 0.3048, tag: 'swapped-feet' },
       { swap: false, scaleE: 0.1, scaleN: 1, tag: 'e/10' },
       { swap: false, scaleE: 1, scaleN: 0.1, tag: 'n/10' },
       { swap: true, scaleE: 0.1, scaleN: 1, tag: 'swapped-e/10' },
@@ -1494,36 +1505,57 @@ export default function App() {
       return score;
     };
 
-    const resolveBestTransform = (samplePairs: Array<{ x: number; y: number }>) => {
-      if (samplePairs.length === 0) return null;
+    const resolveBestTransform = (sampleSegments: SampleSegment[]) => {
+      if (sampleSegments.length === 0) return null;
 
       let best: { transform: ProjectionTransform; score: number; valid: number } | null = null;
       for (const t of transformCandidates) {
         let total = 0;
         let valid = 0;
+        let lengthPenalty = 0;
+        let lengthCount = 0;
 
-        for (const p of samplePairs) {
-          const converted = applyProjectionTransform(p.x, p.y, t);
-          if (!converted) continue;
+        for (const seg of sampleSegments) {
+          const s = applyProjectionTransform(seg.sx, seg.sy, t);
+          const e = applyProjectionTransform(seg.ex, seg.ey, t);
+          if (!s || !e) continue;
           valid += 1;
-          total += scoreConvertedPoint(converted.lat, converted.lng, converted.e, converted.n);
+
+          total += scoreConvertedPoint(s.lat, s.lng, s.e, s.n);
+          total += scoreConvertedPoint(e.lat, e.lng, e.e, e.n);
+
+          if (Number.isFinite(seg.lengthKm) && (seg.lengthKm as number) > 0.05) {
+            const distanceKm = turf.distance(
+              turf.point([s.lng, s.lat]),
+              turf.point([e.lng, e.lat]),
+              { units: 'kilometers' }
+            );
+            const expectedKm = seg.lengthKm as number;
+            const relError = Math.abs(distanceKm - expectedKm) / Math.max(expectedKm, 0.1);
+            lengthPenalty += relError;
+            lengthCount += 1;
+          }
         }
 
         if (valid === 0) continue;
-        const avgScore = total / valid;
-        const validRatio = valid / samplePairs.length;
+        const avgScore = total / (valid * 2);
+        const validRatio = valid / sampleSegments.length;
         if (validRatio < 0.6) continue;
 
-        if (!best || avgScore > best.score) {
-          best = { transform: t, score: avgScore, valid };
+        const avgLengthPenalty = lengthCount > 0 ? (lengthPenalty / lengthCount) : 0;
+        const finalScore = avgScore - avgLengthPenalty * 35;
+
+        if (!best || finalScore > best.score) {
+          best = { transform: t, score: finalScore, valid };
         }
       }
 
       if (!best) return null;
-      console.log(`Projected transform selected for file: ${best.transform.tag} (avgScore=${best.score.toFixed(2)}, valid=${best.valid}/${samplePairs.length})`);
+      console.log(`Projected transform selected for file: ${best.transform.tag} (score=${best.score.toFixed(2)}, valid=${best.valid}/${sampleSegments.length})`);
       return best.transform;
     };
     
+    let lengthColumnIndex = -1;
     if (dataStartIdx > 0 && dataStartIdx < lines.length) {
       // Prefer explicit header-based mapping when present.
       if (headerIdx !== -1) {
@@ -1545,6 +1577,7 @@ export default function App() {
         const sN = tokens.findIndex(isStartNorth);
         const eE = tokens.findIndex(isEndEast);
         const eN = tokens.findIndex(isEndNorth);
+        lengthColumnIndex = tokens.findIndex(t => /length|distance|km/.test(t));
 
         if (sE !== -1 && sN !== -1 && eE !== -1 && eN !== -1) {
           coordColumns = { startLng: sE, startLat: sN, endLng: eE, endLat: eN };
@@ -1596,19 +1629,26 @@ export default function App() {
 
     let chosenTransform: ProjectionTransform | null = null;
     if (isUTM) {
-      const samplePairs: Array<{ x: number; y: number }> = [];
-      for (let i = dataStartIdx; i < lines.length && samplePairs.length < 24; i++) {
+      const sampleSegments: SampleSegment[] = [];
+      for (let i = dataStartIdx; i < lines.length && sampleSegments.length < 16; i++) {
         const fields = parseCSVLine(lines[i]);
         if (fields.length < 5) continue;
         const sx = parseNum(fields[coordColumns.startLng]);
         const sy = parseNum(fields[coordColumns.startLat]);
         const ex = parseNum(fields[coordColumns.endLng]);
         const ey = parseNum(fields[coordColumns.endLat]);
+        const lengthKm = lengthColumnIndex >= 0 ? parseNum(fields[lengthColumnIndex]) : NaN;
         if (Number.isFinite(sx) && Number.isFinite(sy) && Number.isFinite(ex) && Number.isFinite(ey)) {
-          samplePairs.push({ x: sx, y: sy }, { x: ex, y: ey });
+          sampleSegments.push({
+            sx,
+            sy,
+            ex,
+            ey,
+            lengthKm: Number.isFinite(lengthKm) ? lengthKm : undefined
+          });
         }
       }
-      chosenTransform = resolveBestTransform(samplePairs);
+      chosenTransform = resolveBestTransform(sampleSegments);
       if (!chosenTransform) {
         console.warn('No robust projected transform found from sample points; import may skip invalid rows.');
       }
