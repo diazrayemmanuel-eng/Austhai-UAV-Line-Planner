@@ -1423,42 +1423,70 @@ export default function App() {
     const isNumericAt = (fields: string[], idx: number) => Number.isFinite(parseNum(fields[idx]));
 
     const convertProjectedPairToLatLng = (v1: number, v2: number): { lat: number; lng: number } | null => {
-      type Candidate = { e: number; n: number; zone: number };
-      const rawCandidates: Candidate[] = [
-        { e: v1, n: v2, zone: 47 },
-        { e: v1, n: v2, zone: 48 },
-        { e: v2, n: v1, zone: 47 },
-        { e: v2, n: v1, zone: 48 }
+      type Candidate = { e: number; n: number; zone: number; tag: string };
+      const basePairs = [
+        { e: v1, n: v2, tag: 'as-is' },
+        { e: v2, n: v1, tag: 'swapped' },
+        { e: v1 / 10, n: v2, tag: 'e/10' },
+        { e: v1, n: v2 / 10, tag: 'n/10' },
+        { e: v2 / 10, n: v1, tag: 'swapped-e/10' },
+        { e: v2, n: v1 / 10, tag: 'swapped-n/10' }
       ];
 
       const northingOffsets = [0, -10000000, -13000000, -14000000];
-      let best: { lat: number; lng: number; score: number } | null = null;
+      const zones = [47, 48];
+      let best: { lat: number; lng: number; score: number; meta: string } | null = null;
 
-      for (const c of rawCandidates) {
-        for (const offset of northingOffsets) {
-          const n = c.n + offset;
-          if (n <= 0) continue;
-          if (c.e <= 0) continue;
+      for (const base of basePairs) {
+        for (const zone of zones) {
+          for (const offset of northingOffsets) {
+            const e = base.e;
+            const n = base.n + offset;
+            if (!Number.isFinite(e) || !Number.isFinite(n)) continue;
+            if (e <= 0 || n <= 0) continue;
 
-          const converted = utmToLatLng(c.e, n, c.zone, true);
-          if (!Number.isFinite(converted.lat) || !Number.isFinite(converted.lng)) continue;
-          if (Math.abs(converted.lat) > 90 || Math.abs(converted.lng) > 180) continue;
+            const converted = utmToLatLng(e, n, zone, true);
+            if (!Number.isFinite(converted.lat) || !Number.isFinite(converted.lng)) continue;
+            if (Math.abs(converted.lat) > 90 || Math.abs(converted.lng) > 180) continue;
 
-          let score = 0;
-          if (converted.lat >= 4 && converted.lat <= 22 && converted.lng >= 97 && converted.lng <= 106) {
-            score += 50;
-          }
-          // Bias toward likely Thailand area to reduce projection ambiguity.
-          score -= Math.abs(converted.lat - 13) * 0.2;
-          score -= Math.abs(converted.lng - 101) * 0.1;
+            let score = 0;
 
-          if (!best || score > best.score) {
-            best = { ...converted, score };
+            // Broad Thailand bounds.
+            if (converted.lat >= 4 && converted.lat <= 22 && converted.lng >= 97 && converted.lng <= 106) {
+              score += 60;
+            }
+
+            // Stronger preference for central Thailand where most projects are expected.
+            if (converted.lat >= 10 && converted.lat <= 18 && converted.lng >= 98 && converted.lng <= 104) {
+              score += 20;
+            }
+
+            // Bias toward common Easting/Northing magnitudes.
+            if (e >= 150000 && e <= 900000) score += 8;
+            if (n >= 300000 && n <= 2500000) score += 8;
+
+            // Distance penalty from typical Thai centroid to break ties.
+            score -= Math.abs(converted.lat - 13) * 0.4;
+            score -= Math.abs(converted.lng - 101) * 0.2;
+
+            if (!best || score > best.score) {
+              best = {
+                lat: converted.lat,
+                lng: converted.lng,
+                score,
+                meta: `${base.tag}|zone=${zone}|offset=${offset}`
+              };
+            }
           }
         }
       }
 
-      return best ? { lat: best.lat, lng: best.lng } : null;
+      if (best) {
+        console.log('Projected conversion selected:', best.meta, best.lat, best.lng);
+        return { lat: best.lat, lng: best.lng };
+      }
+
+      return null;
     };
     
     if (dataStartIdx > 0 && dataStartIdx < lines.length) {
