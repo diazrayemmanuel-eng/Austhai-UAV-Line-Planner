@@ -1508,18 +1508,31 @@ export default function App() {
     const resolveBestTransform = (sampleSegments: SampleSegment[]) => {
       if (sampleSegments.length === 0) return null;
 
+      console.log('🔍 DEBUG: Starting transform resolution');
+      console.log('Sample segments:', sampleSegments.map(s => ({
+        raw: `(${s.sx}, ${s.sy}) → (${s.ex}, ${s.ey})`,
+        lengthKm: s.lengthKm
+      })));
+
+      const scores: { tag: string; score: number; valid: number; sample?: any }[] = [];
       let best: { transform: ProjectionTransform; score: number; valid: number } | null = null;
+      
       for (const t of transformCandidates) {
         let total = 0;
         let valid = 0;
         let lengthPenalty = 0;
         let lengthCount = 0;
+        let firstConversion: any = null;
 
         for (const seg of sampleSegments) {
           const s = applyProjectionTransform(seg.sx, seg.sy, t);
           const e = applyProjectionTransform(seg.ex, seg.ey, t);
           if (!s || !e) continue;
           valid += 1;
+
+          if (!firstConversion) {
+            firstConversion = { start: [s.lat, s.lng], end: [e.lat, e.lng] };
+          }
 
           total += scoreConvertedPoint(s.lat, s.lng, s.e, s.n);
           total += scoreConvertedPoint(e.lat, e.lng, e.e, e.n);
@@ -1545,13 +1558,29 @@ export default function App() {
         const avgLengthPenalty = lengthCount > 0 ? (lengthPenalty / lengthCount) : 0;
         const finalScore = avgScore - avgLengthPenalty * 35;
 
+        scores.push({ tag: t.tag, score: finalScore, valid, sample: firstConversion });
+
         if (!best || finalScore > best.score) {
           best = { transform: t, score: finalScore, valid };
         }
       }
 
+      console.log('Transform candidates scored:', scores.sort((a, b) => b.score - a.score).slice(0, 10));
+
       if (!best) return null;
-      console.log(`Projected transform selected for file: ${best.transform.tag} (score=${best.score.toFixed(2)}, valid=${best.valid}/${sampleSegments.length})`);
+      console.log(`✅ Selected transform: ${best.transform.tag}`);
+      console.log(`   Score: ${best.score.toFixed(2)}, Valid: ${best.valid}/${sampleSegments.length}`);
+      console.log(`   Transform details:`, best.transform);
+      
+      // Show sample conversion with selected transform
+      if (sampleSegments.length > 0) {
+        const seg = sampleSegments[0];
+        const s = applyProjectionTransform(seg.sx, seg.sy, best.transform);
+        const e = applyProjectionTransform(seg.ex, seg.ey, best.transform);
+        console.log(`   Sample: (${seg.sx}, ${seg.sy}) → Lat/Lng: ${s?.lat.toFixed(6)}, ${s?.lng.toFixed(6)}`);
+        console.log(`   Sample: (${seg.ex}, ${seg.ey}) → Lat/Lng: ${e?.lat.toFixed(6)}, ${e?.lng.toFixed(6)}`);
+      }
+      
       return best.transform;
     };
     
@@ -1612,8 +1641,13 @@ export default function App() {
       const testVal1 = Math.abs(parseNum(firstDataFields[coordColumns.startLng]) || 0);
       const testVal2 = Math.abs(parseNum(firstDataFields[coordColumns.startLat]) || 0);
       
+      console.log('📍 First data row:', firstDataFields);
+      console.log(`📍 Coordinate columns: startLng=${coordColumns.startLng}, startLat=${coordColumns.startLat}, endLng=${coordColumns.endLng}, endLat=${coordColumns.endLat}`);
+      console.log(`📍 First coordinates: (${testVal1}, ${testVal2})`);
+      
       if (testVal1 > 1000 || testVal2 > 1000) {
         isUTM = true;
+        console.log(`✅ Detected UTM coordinates (values > 1000)`);
         // Keep a sensible default; final conversion uses zone/orientation candidates.
         if (settings.importProjection === 'utm52n') utmZone = 52;
         else if (settings.importProjection === 'utm51n') utmZone = 51;
