@@ -1259,6 +1259,44 @@ export default function App() {
     };
   };
 
+  const classifyImportedLineTypes = (lines: Feature<LineString>[]) => {
+    if (lines.length === 0) return lines;
+
+    const hasExplicitTie = lines.some(isTieLineFeature);
+    const hasExplicitFlight = lines.some(isFlightLineFeature);
+
+    // Keep explicit labels when both categories already exist.
+    if (hasExplicitTie && hasExplicitFlight) {
+      return lines.map(line => ({
+        ...line,
+        properties: {
+          ...(line.properties || {}),
+          type: isTieLineFeature(line) ? 'tie' : 'flight'
+        }
+      }));
+    }
+
+    // Infer line class from orientation when types are missing/ambiguous.
+    const ref = getReferenceLonLat(lines);
+    const dominantAngle = estimateDominantAngle(lines.map(line => getLineAzimuth(line, ref)));
+    const tieAngle = normalizeAngle180(dominantAngle + 90);
+
+    return lines.map(line => {
+      const lineAngle = getLineAzimuth(line, ref);
+      const toFlight = circularDistance180(lineAngle, dominantAngle);
+      const toTie = circularDistance180(lineAngle, tieAngle);
+      const inferredType = toTie < toFlight ? 'tie' : 'flight';
+
+      return {
+        ...line,
+        properties: {
+          ...(line.properties || {}),
+          type: inferredType
+        }
+      };
+    });
+  };
+
   // Handlers
   // UTM to Lat/Lng converter
   const utmToLatLng = (easting: number, northing: number, zone: number = 47, isNorthern: boolean = true): { lat: number, lng: number } => {
@@ -1579,9 +1617,15 @@ export default function App() {
 
       // Load imported lines
       if (importedLines.length > 0) {
-        const inferred = inferSettingsFromImportedLines(importedLines);
-        setImportedLineFeatures(importedLines);
+        const classifiedLines = classifyImportedLineTypes(importedLines);
+        const inferred = inferSettingsFromImportedLines(classifiedLines);
+        setImportedLineFeatures(classifiedLines);
         setImportedLinesFileName(files[0].name);
+
+        const tieCount = classifiedLines.filter(isTieLineFeature).length;
+        const flightCount = classifiedLines.length - tieCount;
+        console.log(`Imported line classes: flight=${flightCount}, tie=${tieCount}`);
+
         setSettings(prev => ({
           ...prev,
           angle: inferred.angle,
@@ -1590,7 +1634,8 @@ export default function App() {
         }));
 
         alert(
-          `Successfully imported ${importedLines.length} line feature(s). ` +
+          `Successfully imported ${classifiedLines.length} line feature(s). ` +
+          `Flight lines: ${flightCount}, tie lines: ${tieCount}. ` +
           `Detected angle: ${inferred.angle}deg, ` +
           `flight spacing: ${inferred.flightLineSpacing ?? 'n/a'}m, ` +
           `tie spacing: ${inferred.tieLineSpacing ?? 'n/a'}m.`
