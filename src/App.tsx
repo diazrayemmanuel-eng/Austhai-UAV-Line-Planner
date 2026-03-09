@@ -1382,6 +1382,17 @@ export default function App() {
         headerIdx = i;
         dataStartIdx = i + 1;
         console.log('Detected CSV header at line', i, ':', fields);
+
+        // Support two-row headers like: Start/End (row 1) + Easting/Northing (row 2)
+        if (i + 1 < lines.length) {
+          const nextFields = parseCSVLine(lines[i + 1]);
+          const nextHeaderMatchCount = nextFields.filter(f => headerPatterns.test(f)).length;
+          const nextNumericCount = nextFields.filter(f => !isNaN(parseFloat(f))).length;
+          if (nextHeaderMatchCount >= 2 && nextNumericCount < 2) {
+            dataStartIdx = i + 2;
+            console.log('Detected multi-row CSV header ending at line', i + 1, ':', nextFields);
+          }
+        }
         break;
       }
     }
@@ -1403,33 +1414,113 @@ export default function App() {
       }
     }
 
-    // Identify which columns contain coordinates
-    // Check first numeric row to identify column structure
-    let coordColumns = { startLng: 3, startLat: 4, endLng: 5, endLat: 6 }; // Default
+    // Identify which columns contain coordinates.
+    let coordColumns = { startLng: 1, startLat: 2, endLng: 3, endLat: 4 };
     let isUTM = false;
     let utmZone = 47; // Default for Thailand
+
+    const parseNum = (value?: string) => parseFloat((value || '').replace(/"/g, '').trim());
+    const isNumericAt = (fields: string[], idx: number) => Number.isFinite(parseNum(fields[idx]));
+
+    const convertProjectedPairToLatLng = (v1: number, v2: number): { lat: number; lng: number } | null => {
+      type Candidate = { e: number; n: number; zone: number };
+      const rawCandidates: Candidate[] = [
+        { e: v1, n: v2, zone: 47 },
+        { e: v1, n: v2, zone: 48 },
+        { e: v2, n: v1, zone: 47 },
+        { e: v2, n: v1, zone: 48 }
+      ];
+
+      const northingOffsets = [0, -10000000, -13000000, -14000000];
+      let best: { lat: number; lng: number; score: number } | null = null;
+
+      for (const c of rawCandidates) {
+        for (const offset of northingOffsets) {
+          const n = c.n + offset;
+          if (n <= 0) continue;
+          if (c.e <= 0) continue;
+
+          const converted = utmToLatLng(c.e, n, c.zone, true);
+          if (!Number.isFinite(converted.lat) || !Number.isFinite(converted.lng)) continue;
+          if (Math.abs(converted.lat) > 90 || Math.abs(converted.lng) > 180) continue;
+
+          let score = 0;
+          if (converted.lat >= 4 && converted.lat <= 22 && converted.lng >= 97 && converted.lng <= 106) {
+            score += 50;
+          }
+          // Bias toward likely Thailand area to reduce projection ambiguity.
+          score -= Math.abs(converted.lat - 13) * 0.2;
+          score -= Math.abs(converted.lng - 101) * 0.1;
+
+          if (!best || score > best.score) {
+            best = { ...converted, score };
+          }
+        }
+      }
+
+      return best ? { lat: best.lat, lng: best.lng } : null;
+    };
     
     if (dataStartIdx > 0 && dataStartIdx < lines.length) {
+      // Prefer explicit header-based mapping when present.
+      if (headerIdx !== -1) {
+        const h1 = parseCSVLine(lines[headerIdx]);
+        const h2 = dataStartIdx === headerIdx + 2 ? parseCSVLine(lines[headerIdx + 1]) : [];
+        const width = Math.max(h1.length, h2.length);
+
+        const tokens: string[] = [];
+        for (let idx = 0; idx < width; idx++) {
+          tokens.push(`${(h1[idx] || '').toLowerCase()} ${(h2[idx] || '').toLowerCase()}`.trim());
+        }
+
+        const isStartEast = (t: string) => t.includes('start') && /(east|x|lon|lng|long)/.test(t);
+        const isStartNorth = (t: string) => t.includes('start') && /(north|y|lat)/.test(t);
+        const isEndEast = (t: string) => t.includes('end') && /(east|x|lon|lng|long)/.test(t);
+        const isEndNorth = (t: string) => t.includes('end') && /(north|y|lat)/.test(t);
+
+        const sE = tokens.findIndex(isStartEast);
+        const sN = tokens.findIndex(isStartNorth);
+        const eE = tokens.findIndex(isEndEast);
+        const eN = tokens.findIndex(isEndNorth);
+
+        if (sE !== -1 && sN !== -1 && eE !== -1 && eN !== -1) {
+          coordColumns = { startLng: sE, startLat: sN, endLng: eE, endLat: eN };
+          console.log('Detected coordinate columns from header:', coordColumns);
+        }
+      }
+
       const firstDataFields = parseCSVLine(lines[dataStartIdx]);
-      
-      // Try to detect by column count and position
-      if (firstDataFields.length >= 7) {
-        coordColumns = { startLng: 3, startLat: 4, endLng: 5, endLat: 6 };
-      } else if (firstDataFields.length >= 6) {
-        coordColumns = { startLng: 2, startLat: 3, endLng: 4, endLat: 5 };
-      } else if (firstDataFields.length >= 5) {
-        coordColumns = { startLng: 1, startLat: 2, endLng: 3, endLat: 4 };
+
+      // Heuristic fallback when headers are not descriptive.
+      if (headerIdx === -1) {
+        if (firstDataFields.length >= 7) {
+          if (isNumericAt(firstDataFields, 1) && isNumericAt(firstDataFields, 2) && isNumericAt(firstDataFields, 3) && isNumericAt(firstDataFields, 4)) {
+            coordColumns = { startLng: 1, startLat: 2, endLng: 3, endLat: 4 };
+          } else if (isNumericAt(firstDataFields, 3) && isNumericAt(firstDataFields, 4) && isNumericAt(firstDataFields, 5) && isNumericAt(firstDataFields, 6)) {
+            coordColumns = { startLng: 3, startLat: 4, endLng: 5, endLat: 6 };
+          } else if (isNumericAt(firstDataFields, 2) && isNumericAt(firstDataFields, 3) && isNumericAt(firstDataFields, 4) && isNumericAt(firstDataFields, 5)) {
+            coordColumns = { startLng: 2, startLat: 3, endLng: 4, endLat: 5 };
+          }
+        } else if (firstDataFields.length >= 6) {
+          if (isNumericAt(firstDataFields, 1) && isNumericAt(firstDataFields, 2) && isNumericAt(firstDataFields, 3) && isNumericAt(firstDataFields, 4)) {
+            coordColumns = { startLng: 1, startLat: 2, endLng: 3, endLat: 4 };
+          } else {
+            coordColumns = { startLng: 2, startLat: 3, endLng: 4, endLat: 5 };
+          }
+        } else if (firstDataFields.length >= 5) {
+          coordColumns = { startLng: 1, startLat: 2, endLng: 3, endLat: 4 };
+        }
       }
       
       // Detect if coordinates are UTM (if values are > 1000)
-      const testVal1 = Math.abs(parseFloat(firstDataFields[coordColumns.startLng]?.replace(/"/g, '') || '0'));
-      const testVal2 = Math.abs(parseFloat(firstDataFields[coordColumns.startLat]?.replace(/"/g, '') || '0'));
+      const testVal1 = Math.abs(parseNum(firstDataFields[coordColumns.startLng]) || 0);
+      const testVal2 = Math.abs(parseNum(firstDataFields[coordColumns.startLat]) || 0);
       
       if (testVal1 > 1000 || testVal2 > 1000) {
         isUTM = true;
-        // Guess UTM zone based on easting value (typical Thailand: zone 47-48)
-        if (testVal1 > 600000) utmZone = 48;  // Eastern Thailand
-        else if (testVal1 > 300000) utmZone = 47;  // Western/Central Thailand
+        // Keep a sensible default; final conversion uses zone/orientation candidates.
+        if (testVal1 > 700000) utmZone = 48;
+        else utmZone = 47;
         console.log('Detected UTM coordinates, zone:', utmZone);
       }
       
@@ -1465,10 +1556,11 @@ export default function App() {
           let endLng = coord3;
           let endLat = coord4;
 
-          // Convert UTM to lat/lng if needed
+          // Convert projected coordinates to lat/lng if needed
           if (isUTM) {
-            const start = utmToLatLng(coord1, coord2, utmZone);
-            const end = utmToLatLng(coord3, coord4, utmZone);
+            const start = convertProjectedPairToLatLng(coord1, coord2);
+            const end = convertProjectedPairToLatLng(coord3, coord4);
+            if (!start || !end) continue;
             startLng = start.lng;
             startLat = start.lat;
             endLng = end.lng;
